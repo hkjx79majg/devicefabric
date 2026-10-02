@@ -7,7 +7,7 @@ import json
 import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from .service import Service
+from .service import Service, ServiceError
 
 
 def env_address() -> tuple[str, int]:
@@ -29,11 +29,72 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def send_error_json(self, status: int, code: str, message: str) -> None:
+        self.send_json(status, {"error": {"code": code, "message": message}})
+
+    def read_json_object(self) -> object:
+        length_raw = self.headers.get("Content-Length")
+        if length_raw is None or not length_raw.isdigit():
+            raise ServiceError("request body must be JSON")
+        body = self.rfile.read(int(length_raw))
+        try:
+            return json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise ServiceError("request body must be valid JSON")
+
+    def handle_service_call(self, call) -> None:
+        try:
+            status, payload = call()
+        except ServiceError as exc:
+            self.send_error_json(exc.status, exc.code, exc.message)
+            return
+        self.send_json(status, payload)
+
     def do_GET(self) -> None:
         if self.path == "/healthz":
             self.send_json(200, self.service.health())
             return
-        self.send_json(404, {"error": {"code": "not_found", "message": f"no route for {self.path}"}})
+        device_id = self._extract_device_id(self.path)
+        if device_id is not None:
+            self.handle_service_call(lambda: (200, self.service.get_device(device_id)))
+            return
+        self.send_not_found()
+
+    def do_POST(self) -> None:
+        path = self.path
+        if path == "/v1/devices":
+            def action() -> tuple[int, dict]:
+                return 201, self.service.register_device(self.read_json_object())
+            self.handle_service_call(action)
+            return
+        if path == "/v1/device-auth":
+            def action() -> tuple[int, dict]:
+                return 200, self.service.authenticate(self.read_json_object())
+            self.handle_service_call(action)
+            return
+        device_id = self._extract_device_id(path, "/credential/rotate")
+        if device_id is not None:
+            self.handle_service_call(lambda: (200, self.service.rotate_credential(device_id)))
+            return
+        device_id = self._extract_device_id(path, "/revoke")
+        if device_id is not None:
+            self.handle_service_call(lambda: (200, self.service.revoke_device(device_id)))
+            return
+        self.send_not_found()
+
+    def send_not_found(self) -> None:
+        self.send_error_json(404, "not_found", f"no route for {self.path}")
+
+    @staticmethod
+    def _extract_device_id(path: str, suffix: str = "") -> str | None:
+        prefix = "/v1/devices/"
+        if not path.startswith(prefix) or not path.endswith(suffix):
+            return None
+        end = len(path) - len(suffix) if suffix else len(path)
+        segment = path[len(prefix):end]
+        if segment and all(ch.isascii() and (ch.isalnum() or ch in "._-") for ch in segment):
+            return segment
+        return None
 
     def log_message(self, fmt: str, *args: object) -> None:
         """Silence per-request logging so recorded output stays stable."""
