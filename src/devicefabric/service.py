@@ -1,8 +1,9 @@
 """Core service surface for DeviceFabric.
 
 除健康检查外，本模块实现设备注册与身份凭据生命周期（注册、查询、
-认证、轮换与吊销），以及进程内连接会话与心跳保活。所有数据仅保存
-在当前进程内，进程退出即清空。
+认证、轮换与吊销）、进程内连接会话与心跳保活，以及 MQTT 风格的
+主题订阅、发布与消息拉取。所有数据仅保存在当前进程内，进程退出
+即清空。
 """
 
 from __future__ import annotations
@@ -26,6 +27,11 @@ KEEPALIVE_MAX = 3600
 SESSION_ONLINE = "online"
 SESSION_CLOSED = "closed"
 SESSION_EXPIRED = "expired"
+
+TOPIC_MIN = 1
+TOPIC_MAX = 256
+MAX_MESSAGES_MIN = 1
+MAX_MESSAGES_MAX = 100
 
 
 class ServiceError(Exception):
@@ -92,6 +98,67 @@ def _validate_keepalive(value: object) -> int:
     return value
 
 
+def _split_topic_levels(value: str, label: str) -> list[str]:
+    """主题与过滤器的公共约束：1-256 个码点、斜杠分层、每层非空、禁止 NUL。"""
+    if not TOPIC_MIN <= len(value) <= TOPIC_MAX:
+        raise ServiceError(f"{label} must be 1-256 Unicode code points")
+    if "\x00" in value:
+        raise ServiceError(f"{label} must not contain NUL characters")
+    levels = value.split("/")
+    if any(level == "" for level in levels):
+        raise ServiceError(f"{label} levels must be non-empty")
+    return levels
+
+
+def _validate_topic_name(value: object) -> str:
+    # 发布主题不得包含任何通配符。
+    if not isinstance(value, str) or isinstance(value, bool):
+        raise ServiceError("topic must be a string")
+    for level in _split_topic_levels(value, "topic"):
+        if "+" in level or "#" in level:
+            raise ServiceError("topic must not contain wildcards")
+    return value
+
+
+def _validate_topic_filter(value: object) -> str:
+    # 过滤器中 + 只能独占一层，# 只能独占最后一层且最多出现一次。
+    if not isinstance(value, str) or isinstance(value, bool):
+        raise ServiceError("topic_filter must be a string")
+    levels = _split_topic_levels(value, "topic_filter")
+    for index, level in enumerate(levels):
+        if "#" in level and (level != "#" or index != len(levels) - 1):
+            raise ServiceError("topic_filter # must occupy the entire final level")
+        if "+" in level and level != "+":
+            raise ServiceError("topic_filter + must occupy an entire level")
+    return value
+
+
+def _topic_filter_matches(topic_filter: str, topic: str) -> bool:
+    """MQTT 风格匹配：+ 匹配恰好一层，# 匹配零层或多层（含父层）。"""
+    filter_levels = topic_filter.split("/")
+    topic_levels = topic.split("/")
+    index = 0
+    for level in filter_levels:
+        if level == "#":
+            return True
+        if index >= len(topic_levels):
+            return False
+        if level != "+" and level != topic_levels[index]:
+            return False
+        index += 1
+    return index == len(topic_levels)
+
+
+def _validate_max_messages(value: object) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ServiceError("max_messages must be an integer")
+    if not MAX_MESSAGES_MIN <= value <= MAX_MESSAGES_MAX:
+        raise ServiceError(
+            f"max_messages must be between {MAX_MESSAGES_MIN} and {MAX_MESSAGES_MAX}"
+        )
+    return value
+
+
 class Service:
     """进程内设备注册与凭据生命周期服务。"""
 
@@ -108,6 +175,8 @@ class Service:
         self._online_session_keys: dict[tuple[str, str], str] = {}
         # 记录本进程签发过的全部会话令牌，保证令牌在进程内绝不重复。
         self._issued_session_tokens: set[str] = set()
+        # 记录本进程签发过的全部消息标识，保证标识在进程内绝不重复。
+        self._issued_message_ids: set[str] = set()
 
     def health(self) -> dict[str, str]:
         return {"status": "ok", "service": self.name, "version": self.version}
@@ -276,6 +345,12 @@ class Service:
         self._issued_session_tokens.add(token)
         return token
 
+    @staticmethod
+    def _discard_session_messaging_locked(session: dict) -> None:
+        """会话离线后其订阅与未取消息立即失效，不留存也不被继承。"""
+        session["subscriptions"].clear()
+        session["inbox"].clear()
+
     def _expire_if_timed_out_locked(self, session: dict, now: datetime) -> bool:
         """在线会话超过 expires_at 即转为 expired，不可恢复。"""
         if session["state"] == SESSION_ONLINE and now > session["expires_at"]:
@@ -284,6 +359,7 @@ class Service:
             self._online_session_keys.pop(
                 (session["device_id"], session["client_id"]), None
             )
+            self._discard_session_messaging_locked(session)
             return True
         return False
 
@@ -293,6 +369,34 @@ class Service:
         self._online_session_keys.pop(
             (session["device_id"], session["client_id"]), None
         )
+        self._discard_session_messaging_locked(session)
+
+    def _require_online_session_locked(self, session_id: str, token: str) -> dict:
+        """会话令牌保护的在线会话公共判定：404 → 超时过期 → 401 → 409。"""
+        session = self._sessions.get(session_id)
+        if session is None:
+            raise ServiceError(
+                f"session {session_id!r} not found",
+                code="session_not_found",
+                status=404,
+            )
+        # 任何受令牌保护的操作都会触发超时判定；已过期会话不能恢复。
+        self._expire_if_timed_out_locked(session, _utc_now())
+        if not hmac.compare_digest(
+            session["token"].encode("utf-8"), token.encode("utf-8")
+        ):
+            raise ServiceError(
+                "invalid session token",
+                code="invalid_session_token",
+                status=401,
+            )
+        if session["state"] != SESSION_ONLINE:
+            raise ServiceError(
+                f"session {session_id!r} is not online",
+                code="session_not_online",
+                status=409,
+            )
+        return session
 
     def create_session(self, payload: object) -> dict:
         if not isinstance(payload, dict):
@@ -344,6 +448,9 @@ class Service:
                 "expires_at": now + timedelta(seconds=keepalive),
                 "state": SESSION_ONLINE,
                 "reason": None,
+                # 消息状态随会话生灭：订阅集合与待取队列不跨会话继承。
+                "subscriptions": set(),
+                "inbox": [],
             }
             self._sessions[session["session_id"]] = session
             self._online_session_keys[key] = session["session_id"]
@@ -377,32 +484,104 @@ class Service:
             raise ServiceError("session_token must be a string")
 
         with self._lock:
-            session = self._sessions.get(session_id)
-            if session is None:
-                raise ServiceError(
-                    f"session {session_id!r} not found",
-                    code="session_not_found",
-                    status=404,
-                )
+            session = self._require_online_session_locked(session_id, token)
             now = _utc_now()
-            # 心跳也会触发超时判定；已过期会话不能恢复。
-            self._expire_if_timed_out_locked(session, now)
-            if not hmac.compare_digest(
-                session["token"].encode("utf-8"), token.encode("utf-8")
-            ):
-                raise ServiceError(
-                    "invalid session token",
-                    code="invalid_session_token",
-                    status=401,
-                )
-            if session["state"] != SESSION_ONLINE:
-                raise ServiceError(
-                    f"session {session_id!r} is not online",
-                    code="session_not_online",
-                    status=409,
-                )
             session["last_seen_at"] = now
             session["expires_at"] = now + timedelta(
                 seconds=session["keepalive_seconds"]
             )
             return self._public_session(session)
+
+    # ------------------------------------------------------------------
+    # 主题订阅、发布与消息拉取
+    # ------------------------------------------------------------------
+
+    def _mint_message_id_locked(self) -> str:
+        message_id = secrets.token_urlsafe(16)
+        while message_id in self._issued_message_ids:
+            message_id = secrets.token_urlsafe(16)
+        self._issued_message_ids.add(message_id)
+        return message_id
+
+    @staticmethod
+    def _extract_token(payload: dict, allowed: set[str]) -> str:
+        unknown = set(payload) - allowed
+        if unknown:
+            raise ServiceError(f"unknown field(s): {', '.join(sorted(unknown))}")
+        if "session_token" not in payload:
+            raise ServiceError("missing required field: session_token")
+        token = payload["session_token"]
+        if not isinstance(token, str):
+            raise ServiceError("session_token must be a string")
+        return token
+
+    def add_subscription(self, session_id: str, payload: object) -> dict:
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object")
+        token = self._extract_token(payload, {"session_token", "topic_filter"})
+        if "topic_filter" not in payload:
+            raise ServiceError("missing required field: topic_filter")
+        topic_filter = _validate_topic_filter(payload["topic_filter"])
+
+        with self._lock:
+            session = self._require_online_session_locked(session_id, token)
+            # 重复订阅幂等：集合语义保证不产生副本。
+            session["subscriptions"].add(topic_filter)
+            return {
+                "session_id": session["session_id"],
+                "topic_filter": topic_filter,
+                "subscriptions": sorted(session["subscriptions"]),
+            }
+
+    def publish_message(self, session_id: str, payload: object) -> dict:
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object")
+        token = self._extract_token(payload, {"session_token", "topic", "payload"})
+        for field in ("topic", "payload"):
+            if field not in payload:
+                raise ServiceError(f"missing required field: {field}")
+        topic = _validate_topic_name(payload["topic"])
+        # payload 可为任意 JSON 值（null、标量、数组或对象），无需校验。
+        message_payload = payload["payload"]
+
+        with self._lock:
+            publisher = self._require_online_session_locked(session_id, token)
+            now = _utc_now()
+            # 路由前按保活规则处理全部会话超时，只投递给在线会话。
+            for session in self._sessions.values():
+                self._expire_if_timed_out_locked(session, now)
+            message = {
+                "message_id": self._mint_message_id_locked(),
+                "topic": topic,
+                "payload": message_payload,
+                "publisher_device_id": publisher["device_id"],
+                "published_at": _rfc3339_utc(now),
+            }
+            matched = 0
+            for session in self._sessions.values():
+                if session["state"] != SESSION_ONLINE:
+                    continue
+                # 同一会话即使被多个过滤器命中也只入队一份。
+                if any(
+                    _topic_filter_matches(topic_filter, topic)
+                    for topic_filter in session["subscriptions"]
+                ):
+                    session["inbox"].append(message)
+                    matched += 1
+            return {"message_id": message["message_id"], "matched_count": matched}
+
+    def poll_messages(self, session_id: str, payload: object) -> dict:
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object")
+        token = self._extract_token(payload, {"session_token", "max_messages"})
+        if "max_messages" not in payload:
+            raise ServiceError("missing required field: max_messages")
+        max_messages = _validate_max_messages(payload["max_messages"])
+
+        with self._lock:
+            session = self._require_online_session_locked(session_id, token)
+            inbox = session["inbox"]
+            # 按发布顺序取出并移出队列；空队列返回空数组。
+            messages = inbox[:max_messages]
+            del inbox[:max_messages]
+            return {"messages": messages}

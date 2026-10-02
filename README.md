@@ -34,10 +34,20 @@ PYTHONPATH=src python3 -m devicefabric.server --host 127.0.0.1 --port 8080
 
 读取或心跳时，超过 `expires_at` 的在线会话转为 `expired`（reason 为 `keepalive_timeout`），不可恢复。吊销设备时其在线会话立即变为 `closed`（reason 为 `device_revoked`），吊销响应与幂等语义不变。
 
+## 主题订阅与消息路由
+
+订阅、队列与消息仅保存在当前进程内，进程退出即清空。topic 与 topic_filter 均为 1-256 个 Unicode 码点，由斜杠分层且每层非空，禁止 NUL；topic 不得含通配符。过滤器中 `+` 只能独占一层并匹配恰好一层，`#` 只能独占最后一层、最多一次，可匹配零层或多层。
+
+- `POST /v1/device-sessions/{session_id}/subscriptions`：请求体为 `{"session_token": ..., "topic_filter": ...}`。在线会话返回 `200` 与当前全部过滤器；重复订阅幂等，不产生副本。
+- `POST /v1/device-sessions/{session_id}/publish`：请求体为 `{"session_token": ..., "topic": ..., "payload": ...}`，`payload` 可为任意 JSON 值（null、标量、数组或对象）。返回 `202`、唯一 `message_id` 与 `matched_count`（实际入队的在线会话数）。同一会话即使被多个过滤器命中也只入队一份，允许发布给自身；路由前按保活规则处理超时，只投递给在线会话。
+- `POST /v1/device-sessions/{session_id}/messages/poll`：请求体为 `{"session_token": ..., "max_messages": ...}`（1 至 100 的整数）。返回 `200` 与按发布顺序排列的 `messages` 并将其移出队列，空队列返回空数组；消息包含 `message_id`、`topic`、`payload`、`publisher_device_id` 和 UTC RFC 3339 的 `published_at`。
+
+非 JSON 对象、字段缺失或多余、非法主题及非法 `max_messages` 均返回 `400`（`invalid_request`）且不改变订阅、队列或消费位置。未知会话返回 `404`（`session_not_found`），令牌错误返回 `401`（`invalid_session_token`），令牌正确但会话已 `closed` 或 `expired` 返回 `409`（`session_not_online`）。会话因超时、重连取代或设备吊销离线后，其订阅与未取消息立即失效，新会话不继承，也不保存离线消息。
+
 ## 验证
 
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-当前测试覆盖健康检查基线与设备注册、凭据认证、轮换、吊销以及连接会话、心跳保活的成功与失败语义。主题路由、影子状态与规则引擎仍留待后续任务从已冻结事实出发独立设计并验证。
+当前测试覆盖健康检查基线与设备注册、凭据认证、轮换、吊销、连接会话、心跳保活以及主题订阅、发布与消息拉取的成功与失败语义。影子状态与规则引擎仍留待后续任务从已冻结事实出发独立设计并验证。
