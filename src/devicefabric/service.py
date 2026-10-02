@@ -182,6 +182,8 @@ class Service:
         self._issued_session_tokens: set[str] = set()
         # 记录本进程签发过的全部消息 ID，保证消息在进程内绝不重复。
         self._issued_message_ids: set[str] = set()
+        # 记录本进程签发过的全部投递 ID，保证投递在进程内绝不重复。
+        self._issued_delivery_ids: set[str] = set()
 
     def health(self) -> dict[str, str]:
         return {"status": "ok", "service": self.name, "version": self.version}
@@ -372,9 +374,11 @@ class Service:
 
     @staticmethod
     def _discard_session_routes_locked(session: dict) -> None:
-        """会话离线后订阅与未取消息立即失效，且不被新会话继承。"""
+        """会话离线后订阅、待取消息、未确认投递与确认历史立即失效，且不被新会话继承。"""
         session["subscriptions"].clear()
         session["queue"].clear()
+        session["unacked"].clear()
+        session["acked"].clear()
 
     def create_session(self, payload: object) -> dict:
         if not isinstance(payload, dict):
@@ -429,6 +433,9 @@ class Service:
                 # 订阅过滤器集合（幂等、无副本）与待取消息队列。
                 "subscriptions": set(),
                 "queue": deque(),
+                # QoS 1 已投递未确认的投递记录（按首次投递顺序）与已确认历史。
+                "unacked": {},
+                "acked": set(),
             }
             self._sessions[session["session_id"]] = session
             self._online_session_keys[key] = session["session_id"]
@@ -503,6 +510,13 @@ class Service:
         self._issued_message_ids.add(message_id)
         return message_id
 
+    def _mint_delivery_id_locked(self) -> str:
+        delivery_id = secrets.token_urlsafe(18)
+        while delivery_id in self._issued_delivery_ids:
+            delivery_id = secrets.token_urlsafe(18)
+        self._issued_delivery_ids.add(delivery_id)
+        return delivery_id
+
     def _authenticate_online_session_locked(
         self, session_id: str, token: str, now: datetime
     ) -> dict:
@@ -535,10 +549,12 @@ class Service:
         return session
 
     @staticmethod
-    def _require_fields(payload: object, fields: set[str]) -> dict:
+    def _require_fields(
+        payload: object, fields: set[str], optional: set[str] | None = None
+    ) -> dict:
         if not isinstance(payload, dict):
             raise ServiceError("request body must be a JSON object")
-        unknown = set(payload) - fields
+        unknown = set(payload) - fields - (optional or set())
         if unknown:
             raise ServiceError(f"unknown field(s): {', '.join(sorted(unknown))}")
         for field in fields:
@@ -562,13 +578,19 @@ class Service:
             return {"topic_filter": topic_filter}
 
     def publish_message(self, session_id: str, payload: object) -> dict:
-        data = self._require_fields(payload, {"session_token", "topic", "payload"})
+        data = self._require_fields(
+            payload, {"session_token", "topic", "payload"}, optional={"qos"}
+        )
         token = data["session_token"]
         if not isinstance(token, str) or isinstance(token, bool):
             raise ServiceError("session_token must be a string")
         topic = _validate_topic(data["topic"])
         # payload 可为 null、标量、数组或对象，原样保留。
         message_payload = data["payload"]
+        # 缺省按 QoS 0 处理；显式 qos 只接受整数 0 或 1。
+        qos = data.get("qos", 0)
+        if not isinstance(qos, int) or isinstance(qos, bool) or qos not in (0, 1):
+            raise ServiceError("qos must be the integer 0 or 1")
 
         with self._lock:
             now = _utc_now()
@@ -595,9 +617,23 @@ class Service:
                 ):
                     continue
                 # 同一会话即使被多个过滤器命中也只入队一份。
-                target["queue"].append(message)
+                entry = {"qos": qos, "message": message, "delivery_id": None}
+                if qos == 1:
+                    # 每个命中的在线会话获得独立且不可预测的 delivery_id。
+                    entry["delivery_id"] = self._mint_delivery_id_locked()
+                target["queue"].append(entry)
                 matched += 1
             return {"message_id": message["message_id"], "matched_count": matched}
+
+    @staticmethod
+    def _render_delivery(entry: dict, dup: bool) -> dict:
+        """QoS 0 仅含原有字段；QoS 1 额外携带 qos、delivery_id 与 dup。"""
+        rendered = dict(entry["message"])
+        if entry["qos"] == 1:
+            rendered["qos"] = 1
+            rendered["delivery_id"] = entry["delivery_id"]
+            rendered["dup"] = dup
+        return rendered
 
     def poll_messages(self, session_id: str, payload: object) -> dict:
         data = self._require_fields(payload, {"session_token", "max_messages"})
@@ -610,8 +646,60 @@ class Service:
             session = self._authenticate_online_session_locked(
                 session_id, token, _utc_now()
             )
+            unacked: dict = session["unacked"]
             queue: deque = session["queue"]
-            count = min(max_messages, len(queue))
-            # 按发布顺序取出并移出队列。
-            messages = [queue.popleft() for _ in range(count)]
+            messages: list[dict] = []
+            remaining = max_messages
+            # 未确认的 QoS 1 投递按原发布顺序优先重投，标记 dup；
+            # 它们与首次交付共同受 max_messages 限制，形成自然背压。
+            for entry in unacked.values():
+                if remaining == 0:
+                    break
+                messages.append(self._render_delivery(entry, dup=True))
+                remaining -= 1
+            # 之后按发布顺序交付尚未首次投递的消息。
+            while remaining > 0 and queue:
+                entry = queue.popleft()
+                if entry["qos"] == 1:
+                    # QoS 1 首次投递后转入未确认集合，等待 ack。
+                    unacked[entry["delivery_id"]] = entry
+                messages.append(self._render_delivery(entry, dup=False))
+                remaining -= 1
             return {"messages": messages}
+
+    def ack_messages(self, session_id: str, payload: object) -> dict:
+        data = self._require_fields(payload, {"session_token", "delivery_ids"})
+        token = data["session_token"]
+        if not isinstance(token, str) or isinstance(token, bool):
+            raise ServiceError("session_token must be a string")
+        delivery_ids = data["delivery_ids"]
+        if not isinstance(delivery_ids, list):
+            raise ServiceError("delivery_ids must be an array")
+        if not 1 <= len(delivery_ids) <= 100:
+            raise ServiceError("delivery_ids must contain 1-100 items")
+        if any(not isinstance(d, str) for d in delivery_ids):
+            raise ServiceError("delivery_ids must contain only strings")
+        if len(set(delivery_ids)) != len(delivery_ids):
+            raise ServiceError("delivery_ids must not contain duplicates")
+
+        with self._lock:
+            session = self._authenticate_online_session_locked(
+                session_id, token, _utc_now()
+            )
+            unacked: dict = session["unacked"]
+            acked: set = session["acked"]
+            # 任一标识从未属于该会话：整体不确认任何消息。
+            for delivery_id in delivery_ids:
+                if delivery_id not in unacked and delivery_id not in acked:
+                    raise ServiceError(
+                        f"delivery {delivery_id!r} not found",
+                        code="delivery_not_found",
+                        status=404,
+                    )
+            # 原子地移除相应未确认消息；重复确认幂等且不增加计数。
+            acked_count = 0
+            for delivery_id in delivery_ids:
+                if unacked.pop(delivery_id, None) is not None:
+                    acked.add(delivery_id)
+                    acked_count += 1
+            return {"acked_count": acked_count}

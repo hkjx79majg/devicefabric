@@ -39,10 +39,11 @@ PYTHONPATH=src python3 -m devicefabric.server --host 127.0.0.1 --port 8080
 订阅与消息仅保存在当前进程内，服务重启即清空。主题（topic）与主题过滤器（topic_filter）均为 1-256 个 Unicode 码点，按 `/` 分层且每层非空，禁止 NUL。topic 不得含通配符；过滤器中 `+` 只能独占一层并恰好匹配一层，`#` 只能独占最后一层、最多出现一次，可匹配零层或多层。
 
 - `POST /v1/device-sessions/{session_id}/subscriptions`：请求体为 `{"session_token": ..., "topic_filter": ...}`。在线会话返回 `200 {"topic_filter": ...}`；重复订阅同一过滤器幂等，不产生副本。
-- `POST /v1/device-sessions/{session_id}/publish`：请求体为 `{"session_token": ..., "topic": ..., "payload": ...}`。`payload` 可为任意 JSON 值（null、标量、数组或对象）。返回 `202`、唯一的 `message_id` 与 `matched_count`（实际入队的在线会话数）。同一会话即使被多个过滤器命中也只入队一份；允许发布给自身。消息包含 `message_id`、`topic`、`payload`、`publisher_device_id` 和 UTC RFC 3339 的 `published_at`。
-- `POST /v1/device-sessions/{session_id}/messages/poll`：请求体为 `{"session_token": ..., "max_messages": ...}`，`max_messages` 为 1 至 100 的整数。返回 `200 {"messages": [...]}`，消息按发布顺序排列并在返回后移出队列；空队列返回空数组。
+- `POST /v1/device-sessions/{session_id}/publish`：请求体为 `{"session_token": ..., "topic": ..., "payload": ...}`，可选 `qos` 字段仅接受整数 `0` 或 `1`，缺省按 QoS 0 处理，其他取值返回 `400`（`invalid_request`）且不产生任何投递。`payload` 可为任意 JSON 值（null、标量、数组或对象）。返回 `202`、唯一的 `message_id` 与 `matched_count`（实际入队的在线会话数）。同一会话即使被多个过滤器命中也只入队一份；允许发布给自身。消息包含 `message_id`、`topic`、`payload`、`publisher_device_id` 和 UTC RFC 3339 的 `published_at`。
+- `POST /v1/device-sessions/{session_id}/messages/poll`：请求体为 `{"session_token": ..., "max_messages": ...}`，`max_messages` 为 1 至 100 的整数。返回 `200 {"messages": [...]}`；空队列返回空数组。QoS 0 消息按发布顺序排列、保持原有字段，并在返回后移出队列。QoS 1 消息为每个命中的在线会话生成独立且不可预测的 `delivery_id`，拉取结果在原字段之外包含 `qos`、`delivery_id` 与 `dup`：某 `delivery_id` 首次被拉取时 `dup` 为 `false`，确认前的后续拉取按原发布顺序重投且 `dup` 为 `true`，`message_id` 在重投时保持不变。未确认消息优先于尚未首次交付的消息，二者共同受 `max_messages` 限制，较早的未确认消息因此形成自然背压。
+- `POST /v1/device-sessions/{session_id}/messages/ack`：请求体为 `{"session_token": ..., "delivery_ids": [...]}`，`delivery_ids` 为 1 至 100 个不重复字符串。成功返回 `200 {"acked_count": ...}` 并原子地移除相应未确认消息，`acked_count` 仅为本次新确认的数量；重复确认本会话已确认过的标识幂等成功且不增加计数。任一标识从未属于该会话时返回 `404`（`delivery_not_found`），整个请求不确认任何消息。
 
-三个入口对未知会话返回 `404`（`session_not_found`），令牌错误返回 `401`（`invalid_session_token`），令牌正确但会话已 `closed` 或 `expired` 返回 `409`（`session_not_online`）。路由前按既有保活规则处理超时，且只投递给在线会话。非 JSON 对象、字段缺失或多余、非法主题/过滤器、非法 `max_messages` 均返回 `400`（`invalid_request`），且不改变订阅、队列或消费位置。会话因超时、重连替换或设备吊销离线后，其订阅与未取消息立即失效，新会话不继承，也不保存离线消息。
+四个入口对未知会话返回 `404`（`session_not_found`），令牌错误返回 `401`（`invalid_session_token`），令牌正确但会话已 `closed` 或 `expired` 返回 `409`（`session_not_online`）。路由前按既有保活规则处理超时，且只投递给在线会话。非 JSON 对象、字段缺失或多余、非法主题/过滤器、非法 `max_messages`、非法 `qos` 或非法 `delivery_ids` 均返回 `400`（`invalid_request`），且不改变订阅、队列、未确认集合或消费位置。会话因超时、重连替换或设备吊销离线后，其订阅、待首次投递消息、未确认消息与确认历史立即失效，新会话不继承，也不保存离线消息；不同会话之间的确认状态互不影响。
 
 ## 验证
 
@@ -50,4 +51,4 @@ PYTHONPATH=src python3 -m devicefabric.server --host 127.0.0.1 --port 8080
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-当前测试覆盖健康检查基线与设备注册、凭据认证、轮换、吊销、连接会话、心跳保活以及 MQTT 风格主题订阅、发布与拉取的成功与失败语义。影子状态与规则引擎仍留待后续任务从已冻结事实出发独立设计并验证。
+当前测试覆盖健康检查基线与设备注册、凭据认证、轮换、吊销、连接会话、心跳保活以及 MQTT 风格主题订阅、发布（QoS 0 与 QoS 1）、拉取、重投与确认的成功与失败语义。影子状态与规则引擎仍留待后续任务从已冻结事实出发独立设计并验证。
