@@ -54,6 +54,10 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/healthz":
             self.send_json(200, self.service.health())
             return
+        session_id = self._extract_session_id(self.path)
+        if session_id is not None:
+            self.handle_service_call(lambda: (200, self.service.get_session(session_id)))
+            return
         device_id = self._extract_device_id(self.path)
         if device_id is not None:
             self.handle_service_call(lambda: (200, self.service.get_device(device_id)))
@@ -70,6 +74,19 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/v1/device-auth":
             def action() -> tuple[int, dict]:
                 return 200, self.service.authenticate(self.read_json_object())
+            self.handle_service_call(action)
+            return
+        if path == "/v1/device-sessions":
+            def action() -> tuple[int, dict]:
+                return 201, self.service.create_session(self.read_json_object())
+            self.handle_service_call(action)
+            return
+        session_id = self._extract_session_id(path, "/heartbeat")
+        if session_id is not None:
+            def action() -> tuple[int, dict]:
+                return 200, self.service.heartbeat_session(
+                    session_id, self.read_json_object()
+                )
             self.handle_service_call(action)
             return
         device_id = self._extract_device_id(path, "/credential/rotate")
@@ -93,6 +110,20 @@ class Handler(BaseHTTPRequestHandler):
         end = len(path) - len(suffix) if suffix else len(path)
         segment = path[len(prefix):end]
         if segment and all(ch.isascii() and (ch.isalnum() or ch in "._-") for ch in segment):
+            return segment
+        return None
+
+    @staticmethod
+    def _extract_session_id(path: str, suffix: str = "") -> str | None:
+        prefix = "/v1/device-sessions/"
+        if not path.startswith(prefix) or not path.endswith(suffix):
+            return None
+        end = len(path) - len(suffix) if suffix else len(path)
+        segment = path[len(prefix):end]
+        # session_id 由 token_urlsafe 签发，仅含 ASCII 字母、数字、下划线与短横线。
+        if segment and all(
+            ch.isascii() and (ch.isalnum() or ch in "_-") for ch in segment
+        ):
             return segment
         return None
 
