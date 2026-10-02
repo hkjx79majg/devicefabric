@@ -184,6 +184,9 @@ class Service:
         self._issued_message_ids: set[str] = set()
         # 记录本进程签发过的全部投递 ID，保证投递在进程内绝不重复。
         self._issued_delivery_ids: set[str] = set()
+        # 各精确 topic 的保留消息（topic -> {"qos", "message"}），仅存在于
+        # 当前进程；插入顺序即各主题最近一次保留发布的先后顺序。
+        self._retained: dict[str, dict] = {}
 
     def health(self) -> dict[str, str]:
         return {"status": "ok", "service": self.name, "version": self.version}
@@ -573,13 +576,37 @@ class Service:
             session = self._authenticate_online_session_locked(
                 session_id, token, _utc_now()
             )
-            # 集合保证重复订阅幂等，不产生副本。
+            # 集合保证重复订阅幂等，不产生副本，也不再次回放。
+            if topic_filter in session["subscriptions"]:
+                return {"topic_filter": topic_filter}
             session["subscriptions"].add(topic_filter)
+            self._replay_retained_locked(session, topic_filter)
             return {"topic_filter": topic_filter}
+
+    def _replay_retained_locked(self, session: dict, topic_filter: str) -> None:
+        """把当前匹配该过滤器的保留消息按各主题最近一次保留发布的先后
+        顺序加入会话队列；同次回放中每个精确 topic 只入队一份。"""
+        filter_layers = _split_topic_layers(topic_filter)
+        for record in self._retained.values():
+            message = record["message"]
+            if not _topic_matches_filter(
+                _split_topic_layers(message["topic"]), filter_layers
+            ):
+                continue
+            # 回放沿用原消息字段并标记 retained；实时投递不带该字段。
+            entry = {
+                "qos": record["qos"],
+                "message": {**message, "retained": True},
+                "delivery_id": None,
+            }
+            if record["qos"] == 1:
+                # 每个目标会话获得独立且不可预测的 delivery_id。
+                entry["delivery_id"] = self._mint_delivery_id_locked()
+            session["queue"].append(entry)
 
     def publish_message(self, session_id: str, payload: object) -> dict:
         data = self._require_fields(
-            payload, {"session_token", "topic", "payload"}, optional={"qos"}
+            payload, {"session_token", "topic", "payload"}, optional={"qos", "retain"}
         )
         token = data["session_token"]
         if not isinstance(token, str) or isinstance(token, bool):
@@ -591,6 +618,10 @@ class Service:
         qos = data.get("qos", 0)
         if not isinstance(qos, int) or isinstance(qos, bool) or qos not in (0, 1):
             raise ServiceError("qos must be the integer 0 or 1")
+        # 缺省按 false 处理；显式 retain 只接受 JSON 布尔值。
+        retain = data.get("retain", False)
+        if not isinstance(retain, bool):
+            raise ServiceError("retain must be a JSON boolean")
 
         with self._lock:
             now = _utc_now()
@@ -623,6 +654,16 @@ class Service:
                     entry["delivery_id"] = self._mint_delivery_id_locked()
                 target["queue"].append(entry)
                 matched += 1
+            if retain:
+                if message_payload is None:
+                    # retain + null payload：仍实时投递，同时清除该主题的
+                    # 保留值；不存在也成功。
+                    self._retained.pop(topic, None)
+                else:
+                    # 按精确 topic 覆盖旧值，即使无人匹配也保存；覆盖后
+                    # 该主题排在最近一次保留发布的末尾。
+                    self._retained.pop(topic, None)
+                    self._retained[topic] = {"qos": qos, "message": message}
             return {"message_id": message["message_id"], "matched_count": matched}
 
     @staticmethod
