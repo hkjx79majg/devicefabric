@@ -11,6 +11,7 @@ import hmac
 import re
 import secrets
 import threading
+from collections import deque
 from datetime import datetime, timedelta, timezone
 
 from . import __version__
@@ -22,6 +23,11 @@ DISPLAY_NAME_MIN = 1
 DISPLAY_NAME_MAX = 128
 KEEPALIVE_MIN = 5
 KEEPALIVE_MAX = 3600
+
+TOPIC_MIN = 1
+TOPIC_MAX = 256
+POLL_MIN = 1
+POLL_MAX = 100
 
 SESSION_ONLINE = "online"
 SESSION_CLOSED = "closed"
@@ -92,6 +98,72 @@ def _validate_keepalive(value: object) -> int:
     return value
 
 
+def _split_topic_layers(value: str) -> list[str]:
+    """按斜杠分层；空层（含首尾或连续斜杠）非法。"""
+    return value.split("/")
+
+
+def _validate_topic(value: object) -> str:
+    if not isinstance(value, str) or isinstance(value, bool):
+        raise ServiceError("topic must be a string")
+    if not TOPIC_MIN <= len(value) <= TOPIC_MAX:
+        raise ServiceError("topic must be 1-256 Unicode characters")
+    if "\x00" in value:
+        raise ServiceError("topic must not contain NUL characters")
+    layers = _split_topic_layers(value)
+    if not layers or any(layer == "" for layer in layers):
+        raise ServiceError("topic layers must be non-empty")
+    for layer in layers:
+        if "+" in layer or "#" in layer:
+            raise ServiceError("topic must not contain wildcard characters")
+    return value
+
+
+def _validate_topic_filter(value: object) -> str:
+    if not isinstance(value, str) or isinstance(value, bool):
+        raise ServiceError("topic_filter must be a string")
+    if not TOPIC_MIN <= len(value) <= TOPIC_MAX:
+        raise ServiceError("topic_filter must be 1-256 Unicode characters")
+    if "\x00" in value:
+        raise ServiceError("topic_filter must not contain NUL characters")
+    layers = _split_topic_layers(value)
+    if not layers or any(layer == "" for layer in layers):
+        raise ServiceError("topic_filter layers must be non-empty")
+    for index, layer in enumerate(layers):
+        if "#" in layer:
+            # # 只能独占最后一层且最多出现一次。
+            if layer != "#" or index != len(layers) - 1:
+                raise ServiceError(
+                    "'#' must occupy the last layer alone and appear at most once"
+                )
+        if "+" in layer and layer != "+":
+            raise ServiceError("'+' must occupy a whole layer alone")
+    return value
+
+
+def _topic_matches_filter(topic_layers: list[str], filter_layers: list[str]) -> bool:
+    """MQTT 风格匹配：+ 匹配一层，末尾 # 匹配零层或多层。"""
+    ti = 0
+    for fi, layer in enumerate(filter_layers):
+        if layer == "#":
+            # # 必为最后一层，剩余任意层数（含零层）均匹配。
+            return True
+        if ti >= len(topic_layers):
+            return False
+        if layer != "+" and layer != topic_layers[ti]:
+            return False
+        ti += 1
+    return ti == len(topic_layers)
+
+
+def _validate_max_messages(value: object) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ServiceError("max_messages must be an integer")
+    if not POLL_MIN <= value <= POLL_MAX:
+        raise ServiceError(f"max_messages must be between {POLL_MIN} and {POLL_MAX}")
+    return value
+
+
 class Service:
     """进程内设备注册与凭据生命周期服务。"""
 
@@ -108,6 +180,8 @@ class Service:
         self._online_session_keys: dict[tuple[str, str], str] = {}
         # 记录本进程签发过的全部会话令牌，保证令牌在进程内绝不重复。
         self._issued_session_tokens: set[str] = set()
+        # 记录本进程签发过的全部消息 ID，保证消息在进程内绝不重复。
+        self._issued_message_ids: set[str] = set()
 
     def health(self) -> dict[str, str]:
         return {"status": "ok", "service": self.name, "version": self.version}
@@ -284,6 +358,7 @@ class Service:
             self._online_session_keys.pop(
                 (session["device_id"], session["client_id"]), None
             )
+            self._discard_session_routes_locked(session)
             return True
         return False
 
@@ -293,6 +368,13 @@ class Service:
         self._online_session_keys.pop(
             (session["device_id"], session["client_id"]), None
         )
+        self._discard_session_routes_locked(session)
+
+    @staticmethod
+    def _discard_session_routes_locked(session: dict) -> None:
+        """会话离线后订阅与未取消息立即失效，且不被新会话继承。"""
+        session["subscriptions"].clear()
+        session["queue"].clear()
 
     def create_session(self, payload: object) -> dict:
         if not isinstance(payload, dict):
@@ -344,6 +426,9 @@ class Service:
                 "expires_at": now + timedelta(seconds=keepalive),
                 "state": SESSION_ONLINE,
                 "reason": None,
+                # 订阅过滤器集合（幂等、无副本）与待取消息队列。
+                "subscriptions": set(),
+                "queue": deque(),
             }
             self._sessions[session["session_id"]] = session
             self._online_session_keys[key] = session["session_id"]
@@ -406,3 +491,127 @@ class Service:
                 seconds=session["keepalive_seconds"]
             )
             return self._public_session(session)
+
+    # ------------------------------------------------------------------
+    # MQTT 风格主题路由：订阅、发布与拉取
+    # ------------------------------------------------------------------
+
+    def _mint_message_id_locked(self) -> str:
+        message_id = secrets.token_urlsafe(18)
+        while message_id in self._issued_message_ids:
+            message_id = secrets.token_urlsafe(18)
+        self._issued_message_ids.add(message_id)
+        return message_id
+
+    def _authenticate_online_session_locked(
+        self, session_id: str, token: str, now: datetime
+    ) -> dict:
+        """定位并校验会话：未知 404、令牌错误 401、已离线 409。
+
+        校验令牌前先按既有保活规则处理超时。
+        """
+        session = self._sessions.get(session_id)
+        if session is None:
+            raise ServiceError(
+                f"session {session_id!r} not found",
+                code="session_not_found",
+                status=404,
+            )
+        self._expire_if_timed_out_locked(session, now)
+        if not hmac.compare_digest(
+            session["token"].encode("utf-8"), token.encode("utf-8")
+        ):
+            raise ServiceError(
+                "invalid session token",
+                code="invalid_session_token",
+                status=401,
+            )
+        if session["state"] != SESSION_ONLINE:
+            raise ServiceError(
+                f"session {session_id!r} is not online",
+                code="session_not_online",
+                status=409,
+            )
+        return session
+
+    @staticmethod
+    def _require_fields(payload: object, fields: set[str]) -> dict:
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object")
+        unknown = set(payload) - fields
+        if unknown:
+            raise ServiceError(f"unknown field(s): {', '.join(sorted(unknown))}")
+        for field in fields:
+            if field not in payload:
+                raise ServiceError(f"missing required field: {field}")
+        return payload
+
+    def subscribe_topic(self, session_id: str, payload: object) -> dict:
+        data = self._require_fields(payload, {"session_token", "topic_filter"})
+        token = data["session_token"]
+        if not isinstance(token, str) or isinstance(token, bool):
+            raise ServiceError("session_token must be a string")
+        topic_filter = _validate_topic_filter(data["topic_filter"])
+
+        with self._lock:
+            session = self._authenticate_online_session_locked(
+                session_id, token, _utc_now()
+            )
+            # 集合保证重复订阅幂等，不产生副本。
+            session["subscriptions"].add(topic_filter)
+            return {"topic_filter": topic_filter}
+
+    def publish_message(self, session_id: str, payload: object) -> dict:
+        data = self._require_fields(payload, {"session_token", "topic", "payload"})
+        token = data["session_token"]
+        if not isinstance(token, str) or isinstance(token, bool):
+            raise ServiceError("session_token must be a string")
+        topic = _validate_topic(data["topic"])
+        # payload 可为 null、标量、数组或对象，原样保留。
+        message_payload = data["payload"]
+
+        with self._lock:
+            now = _utc_now()
+            publisher = self._authenticate_online_session_locked(
+                session_id, token, now
+            )
+            topic_layers = _split_topic_layers(topic)
+            message = {
+                "message_id": self._mint_message_id_locked(),
+                "topic": topic,
+                "payload": message_payload,
+                "publisher_device_id": publisher["device_id"],
+                "published_at": _rfc3339_utc(now),
+            }
+            matched = 0
+            for target in self._sessions.values():
+                # 路由前按既有保活规则处理超时，只投递给在线会话。
+                self._expire_if_timed_out_locked(target, now)
+                if target["state"] != SESSION_ONLINE:
+                    continue
+                if not any(
+                    _topic_matches_filter(topic_layers, _split_topic_layers(sub))
+                    for sub in target["subscriptions"]
+                ):
+                    continue
+                # 同一会话即使被多个过滤器命中也只入队一份。
+                target["queue"].append(message)
+                matched += 1
+            return {"message_id": message["message_id"], "matched_count": matched}
+
+    def poll_messages(self, session_id: str, payload: object) -> dict:
+        data = self._require_fields(payload, {"session_token", "max_messages"})
+        token = data["session_token"]
+        if not isinstance(token, str) or isinstance(token, bool):
+            raise ServiceError("session_token must be a string")
+        max_messages = _validate_max_messages(data["max_messages"])
+
+        with self._lock:
+            session = self._authenticate_online_session_locked(
+                session_id, token, _utc_now()
+            )
+            queue: deque = session["queue"]
+            count = min(max_messages, len(queue))
+            # 按发布顺序取出并移出队列。
+            messages = [queue.popleft() for _ in range(count)]
+            return {"messages": messages}

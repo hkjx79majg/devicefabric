@@ -87,6 +87,24 @@ class Handler(BaseHTTPRequestHandler):
                 return 200, self.service.heartbeat_session(session_id, self.read_json_object())
             self.handle_service_call(action)
             return
+        session_id = self._extract_session_id(path, "/subscriptions")
+        if session_id is not None:
+            def action() -> tuple[int, dict]:
+                return 200, self.service.subscribe_topic(session_id, self.read_json_object())
+            self.handle_service_call(action)
+            return
+        session_id = self._extract_session_id(path, "/publish")
+        if session_id is not None:
+            def action() -> tuple[int, dict]:
+                return 202, self.service.publish_message(session_id, self.read_json_object())
+            self.handle_service_call(action)
+            return
+        session_id = self._extract_session_id(path, "/messages/poll")
+        if session_id is not None:
+            def action() -> tuple[int, dict]:
+                return 200, self.service.poll_messages(session_id, self.read_json_object())
+            self.handle_service_call(action)
+            return
         device_id = self._extract_device_id(path, "/credential/rotate")
         if device_id is not None:
             self.handle_service_call(lambda: (200, self.service.rotate_credential(device_id)))
