@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import copy
 import hmac
 import re
 import secrets
@@ -164,6 +165,46 @@ def _validate_max_messages(value: object) -> int:
     return value
 
 
+def _validate_shadow_state(value: object) -> dict:
+    # state 必须是 JSON 对象（Python dict）；数组、标量与 null 均非法。
+    if not isinstance(value, dict):
+        raise ServiceError("state must be a JSON object")
+    return value
+
+
+def _validate_expected_version(value: object) -> int:
+    # 须为非负整数；布尔值虽属 int 子类也明确拒绝。
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ServiceError("expected_version must be a non-negative integer")
+    return value
+
+
+# 递归比较哨兵：表示该成员在 desired 与 reported 间完全一致，差异中不保留。
+_NO_DELTA = object()
+
+
+def _shadow_delta(desired: object, reported: object) -> object:
+    """递归计算 desired 相对 reported 的差异。
+
+    仅保留 desired 中 reported 缺失或值不同的成员；reported 独有成员被
+    忽略。两边同为对象时递归比较；数组及其他非对象值（含 null、标量）
+    整体比较，一致返回哨兵，不一致则取 desired 的深拷贝。
+    """
+    if isinstance(desired, dict) and isinstance(reported, dict):
+        delta: dict = {}
+        for key, desired_value in desired.items():
+            if key not in reported:
+                delta[key] = copy.deepcopy(desired_value)
+                continue
+            child = _shadow_delta(desired_value, reported[key])
+            if child is not _NO_DELTA:
+                delta[key] = child
+        return _NO_DELTA if not delta else delta
+    if desired == reported:
+        return _NO_DELTA
+    return copy.deepcopy(desired)
+
+
 class Service:
     """进程内设备注册与凭据生命周期服务。"""
 
@@ -173,6 +214,9 @@ class Service:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._devices: dict[str, dict] = {}
+        # 按设备保存的进程内影子（与设备同生命周期，重启即清空）。
+        # 吊销、凭据轮换或会话离线均不删除影子。
+        self._shadows: dict[str, dict] = {}
         # 记录本进程签发过的全部凭据，保证凭据在进程内绝不重复。
         self._issued_credentials: set[str] = set()
         self._sessions: dict[str, dict] = {}
@@ -210,6 +254,17 @@ class Service:
         self._issued_credentials.add(credential)
         return credential
 
+    @staticmethod
+    def _new_shadow_locked(device_id: str) -> dict:
+        """初始影子：version 为 0，三种状态为空对象，updated_at 为 None。"""
+        return {
+            "device_id": device_id,
+            "version": 0,
+            "desired": {},
+            "reported": {},
+            "updated_at": None,
+        }
+
     def register_device(self, payload: object) -> dict:
         if not isinstance(payload, dict):
             raise ServiceError("request body must be a JSON object")
@@ -240,6 +295,8 @@ class Service:
                 "credential": credential,
             }
             self._devices[device_id] = device
+            # 注册即初始化影子；后续凭据轮换、吊销或会话离线均不影响它。
+            self._shadows[device_id] = self._new_shadow_locked(device_id)
             result = self._public_device(device)
             result["credential"] = credential
             return result
@@ -765,3 +822,100 @@ class Service:
                     acked.add(delivery_id)
                     acked_count += 1
             return {"acked_count": acked_count}
+
+    # ------------------------------------------------------------------
+    # 设备影子：期望状态、实际状态与差异
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _public_shadow(shadow: dict) -> dict:
+        delta = _shadow_delta(shadow["desired"], shadow["reported"])
+        # 根层两状态都是对象，delta 若非哨兵必为 dict。
+        delta_value = {} if delta is _NO_DELTA else delta
+        return {
+            "device_id": shadow["device_id"],
+            "version": shadow["version"],
+            "desired": copy.deepcopy(shadow["desired"]),
+            "reported": copy.deepcopy(shadow["reported"]),
+            "delta": copy.deepcopy(delta_value),
+            "updated_at": shadow["updated_at"],
+        }
+
+    def get_device_shadow(self, device_id: str) -> dict:
+        with self._lock:
+            shadow = self._shadows.get(device_id)
+            if shadow is None:
+                raise ServiceError(
+                    f"device {device_id!r} not found",
+                    code="device_not_found",
+                    status=404,
+                )
+            return self._public_shadow(shadow)
+
+    def update_shadow_desired(self, device_id: str, payload: object) -> dict:
+        data = self._require_fields(
+            payload, {"state"}, optional={"expected_version"}
+        )
+        state = _validate_shadow_state(data["state"])
+        expected_version = None
+        if "expected_version" in data:
+            expected_version = _validate_expected_version(data["expected_version"])
+
+        with self._lock:
+            shadow = self._shadows.get(device_id)
+            if shadow is None:
+                raise ServiceError(
+                    f"device {device_id!r} not found",
+                    code="device_not_found",
+                    status=404,
+                )
+            # 已吊销设备仍可读写 desired；不检查 active。
+            return self._commit_shadow_write_locked(
+                shadow, "desired", state, expected_version
+            )
+
+    def update_shadow_reported(self, session_id: str, payload: object) -> dict:
+        data = self._require_fields(
+            payload, {"session_token", "state"}, optional={"expected_version"}
+        )
+        token = data["session_token"]
+        if not isinstance(token, str) or isinstance(token, bool):
+            raise ServiceError("session_token must be a string")
+        state = _validate_shadow_state(data["state"])
+        expected_version = None
+        if "expected_version" in data:
+            expected_version = _validate_expected_version(data["expected_version"])
+
+        with self._lock:
+            # 沿用会话鉴权及超时规则：未知 404、令牌错误 401、离线 409。
+            session = self._authenticate_online_session_locked(
+                session_id, token, _utc_now()
+            )
+            shadow = self._shadows.get(session["device_id"])
+            # 会话归属的设备必已注册，影子在注册时已初始化。
+            if shadow is None:  # pragma: no cover - 理论上不可达
+                raise ServiceError(
+                    f"device {session['device_id']!r} not found",
+                    code="device_not_found",
+                    status=404,
+                )
+            return self._commit_shadow_write_locked(
+                shadow, "reported", state, expected_version
+            )
+
+    def _commit_shadow_write_locked(
+        self, shadow: dict, key: str, state: dict, expected_version: int | None
+    ) -> dict:
+        """在持有锁时完成乐观并发检查与写入，保证并发同版本至多一个成功。"""
+        if expected_version is not None and expected_version != shadow["version"]:
+            raise ServiceError(
+                f"expected_version {expected_version} does not match shadow version "
+                f"{shadow['version']}",
+                code="shadow_version_conflict",
+                status=409,
+            )
+        # 整体替换对应状态；即使内容相同 version 也递增。
+        shadow[key] = copy.deepcopy(state)
+        shadow["version"] += 1
+        shadow["updated_at"] = _rfc3339_utc(_utc_now())
+        return self._public_shadow(shadow)

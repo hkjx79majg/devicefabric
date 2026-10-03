@@ -54,6 +54,10 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/healthz":
             self.send_json(200, self.service.health())
             return
+        device_id = self._extract_device_id(self.path, "/shadow")
+        if device_id is not None:
+            self.handle_service_call(lambda: (200, self.service.get_device_shadow(device_id)))
+            return
         device_id = self._extract_device_id(self.path)
         if device_id is not None:
             self.handle_service_call(lambda: (200, self.service.get_device(device_id)))
@@ -61,6 +65,17 @@ class Handler(BaseHTTPRequestHandler):
         session_id = self._extract_session_id(self.path)
         if session_id is not None:
             self.handle_service_call(lambda: (200, self.service.get_session(session_id)))
+            return
+        self.send_not_found()
+
+    def do_PUT(self) -> None:
+        device_id = self._extract_device_id(self.path, "/shadow/desired")
+        if device_id is not None:
+            def action() -> tuple[int, dict]:
+                return 200, self.service.update_shadow_desired(
+                    device_id, self.read_json_object()
+                )
+            self.handle_service_call(action)
             return
         self.send_not_found()
 
@@ -85,6 +100,14 @@ class Handler(BaseHTTPRequestHandler):
         if session_id is not None:
             def action() -> tuple[int, dict]:
                 return 200, self.service.heartbeat_session(session_id, self.read_json_object())
+            self.handle_service_call(action)
+            return
+        session_id = self._extract_session_id(path, "/shadow/reported")
+        if session_id is not None:
+            def action() -> tuple[int, dict]:
+                return 200, self.service.update_shadow_reported(
+                    session_id, self.read_json_object()
+                )
             self.handle_service_call(action)
             return
         session_id = self._extract_session_id(path, "/subscriptions")
