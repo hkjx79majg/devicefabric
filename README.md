@@ -28,7 +28,9 @@ PYTHONPATH=src python3 -m devicefabric.server --host 127.0.0.1 --port 8080
 
 会话仅保存在当前进程内，服务重启即清空。
 
-- `POST /v1/device-sessions`：请求体为 `{"device_id": ..., "credential": ..., "client_id": ..., "keepalive_seconds": ...}`。`client_id` 校验规则同 `device_id`；`keepalive_seconds` 为 5 至 3600 的整数。当前凭据有效且设备 active 时返回 `201`，包含唯一不可预测的 `session_id`、仅此次返回的 `session_token`，以及 `device_id`、`client_id`、`connected_at`、`last_seen_at`、`expires_at`（UTC RFC 3339）和 `online` 状态。同设备同 `client_id` 重连时新会话取代旧会话，旧会话变为 `closed`（reason 为 `replaced`）。设备不存在、凭据错误、凭据已轮换或设备已吊销统一返回 `401`（`invalid_credential`）。
+- `POST /v1/device-sessions`：请求体为 `{"device_id": ..., "credential": ..., "client_id": ..., "keepalive_seconds": ...}`，可选 `clean_start` 字段缺省按 `true` 处理，显式提供时只接受 JSON 布尔值；非布尔值返回 `400`（`invalid_request`），且不得关闭旧会话或改变任何持久状态。`client_id` 校验规则同 `device_id`；`keepalive_seconds` 为 5 至 3600 的整数。当前凭据有效且设备 active 时返回 `201`，包含唯一不可预测的 `session_id`、仅此次返回的 `session_token`，以及 `device_id`、`client_id`、`connected_at`、`last_seen_at`、`expires_at`（UTC RFC 3339）和 `online` 状态。同设备同 `client_id` 重连时新会话取代旧会话，旧会话变为 `closed`（reason 为 `replaced`）。设备不存在、凭据错误、凭据已轮换或设备已吊销统一返回 `401`（`invalid_credential`）。
+  - `clean_start` 未提供或为 `true`：按现有临时会话处理。会话离线（超时、重连替换或设备吊销）后其订阅、待取消息、未确认消息与确认历史立即丢弃，新会话不继承。同组合以 `true` 连接时，先清除该 `(device_id, client_id)` 组合的全部持久状态，再建立全新临时会话。
+  - `clean_start` 为 `false`：以 `device_id` 与 `client_id` 的组合标识一个进程内持久会话。首次使用该组合时建立空状态；后续通过订阅入口成功添加的过滤器、QoS 1 待投递消息、未确认消息及确认历史都归属于该持久会话。以 `false` 重连时复用并保留状态、关闭被替换的在线会话，原订阅立即生效且不触发保留消息回放；旧 `session_id` 与 `session_token` 仍按现有规则失效。持久状态在该组合没有在线会话期间继续保留，直到同组合以 `clean_start` 为 `true` 重连或设备被吊销；凭据轮换不清除，进程重启仍清空全部数据。
 - `POST /v1/device-sessions/{session_id}/heartbeat`：请求体为 `{"session_token": ...}`。在线会话返回 `200` 并刷新 `last_seen_at` 与 `expires_at`；token 不匹配返回 `401`（`invalid_session_token`），对 `closed` 或 `expired` 会话心跳返回 `409`（`session_not_online`），失败请求不刷新时间。
 - `GET /v1/device-sessions/{session_id}`：返回 `200` 与不含 `session_token` 的会话快照（含 `state` 与 `reason`）；未知会话返回 `404`（`session_not_found`）。
 
@@ -43,7 +45,13 @@ PYTHONPATH=src python3 -m devicefabric.server --host 127.0.0.1 --port 8080
 - `POST /v1/device-sessions/{session_id}/messages/poll`：请求体为 `{"session_token": ..., "max_messages": ...}`，`max_messages` 为 1 至 100 的整数。返回 `200 {"messages": [...]}`；空队列返回空数组。QoS 0 消息按发布顺序排列、保持原有字段，并在返回后移出队列。QoS 1 消息为每个命中的在线会话生成独立且不可预测的 `delivery_id`，拉取结果在原字段之外包含 `qos`、`delivery_id` 与 `dup`：某 `delivery_id` 首次被拉取时 `dup` 为 `false`，确认前的后续拉取按原发布顺序重投且 `dup` 为 `true`，`message_id` 在重投时保持不变。未确认消息优先于尚未首次交付的消息，二者共同受 `max_messages` 限制，较早的未确认消息因此形成自然背压。
 - `POST /v1/device-sessions/{session_id}/messages/ack`：请求体为 `{"session_token": ..., "delivery_ids": [...]}`，`delivery_ids` 为 1 至 100 个不重复字符串。成功返回 `200 {"acked_count": ...}` 并原子地移除相应未确认消息，`acked_count` 仅为本次新确认的数量；重复确认本会话已确认过的标识幂等成功且不增加计数。任一标识从未属于该会话时返回 `404`（`delivery_not_found`），整个请求不确认任何消息。
 
-四个入口对未知会话返回 `404`（`session_not_found`），令牌错误返回 `401`（`invalid_session_token`），令牌正确但会话已 `closed` 或 `expired` 返回 `409`（`session_not_online`）。路由前按既有保活规则处理超时，且只投递给在线会话。非 JSON 对象、字段缺失或多余、非法主题/过滤器、非法 `max_messages`、非法 `qos`、非法 `retain` 或非法 `delivery_ids` 均返回 `400`（`invalid_request`），且不改变订阅、队列、未确认集合、消费位置或保留状态。会话因超时、重连替换或设备吊销离线后，其订阅、待首次投递消息、未确认消息与确认历史立即失效，新会话不继承，也不保存离线消息；不同会话之间的确认状态互不影响。
+四个入口对未知会话返回 `404`（`session_not_found`），令牌错误返回 `401`（`invalid_session_token`），令牌正确但会话已 `closed` 或 `expired` 返回 `409`（`session_not_online`）。路由前按既有保活规则处理超时，且只投递给在线会话。非 JSON 对象、字段缺失或多余、非法主题/过滤器、非法 `max_messages`、非法 `qos`、非法 `retain` 或非法 `delivery_ids` 均返回 `400`（`invalid_request`），且不改变订阅、队列、未确认集合、消费位置或保留状态。临时会话因超时、重连替换或设备吊销离线后，其订阅、待首次投递消息、未确认消息与确认历史立即失效，新会话不继承，也不保存离线消息；不同会话之间的确认状态互不影响。
+
+### 持久会话的离线投递
+
+`clean_start` 为 `false` 的组合没有在线会话期间（超时离线、被同组合重连替换之后），其持久订阅继续参与匹配：普通发布和规则动作只把匹配的 **QoS 1** 消息加入该持久会话的离线队列，QoS 0 消息不保存；每个持久会话即使有多个过滤器命中同一消息也只保存一份，并为该目标生成独立且不可预测的 `delivery_id`。离线保存不计入发布响应的 `matched_count`，该字段继续只统计实际入队的在线会话数；动作消息同样可以进入离线队列且不计入 `matched_count`。
+
+以同一 `device_id`、`client_id` 且 `clean_start` 为 `false` 重新连接后，原订阅立即生效且不触发保留消息回放，待收消息可由现有拉取与确认入口消费：消息保留原 `message_id`、主题、载荷、发布者与发布时间，每个目标的 `delivery_id` 保持独立；曾拉取但未确认的消息继续以相同 `delivery_id` 且 `dup` 为 `true` 优先重投，从未拉取的消息首次返回 `dup` 为 `false`，整体保持原发布顺序，确认历史同样保留（重复确认幂等）。在线期间首次成功添加新过滤器时，仍按现有规则回放当时的保留消息快照。设备吊销时清除该设备的全部持久会话；凭据轮换不清除；进程重启仍清空全部数据。
 
 ## 设备影子
 
@@ -84,4 +92,4 @@ PYTHONPATH=src python3 -m devicefabric.server --host 127.0.0.1 --port 8080
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-当前测试覆盖健康检查基线与设备注册、凭据认证、轮换、吊销、连接会话、心跳保活、MQTT 风格主题订阅、发布（QoS 0 与 QoS 1）、拉取、重投与确认、设备影子的期望/实际状态写入、差异计算、版本冲突与会话鉴权，以及规则引擎的创建、列表、启停、删除、字段校验、条件评估与动作投递（含顺序、QoS、不递归触发、回放不触发）的成功与失败语义。
+当前测试覆盖健康检查基线与设备注册、凭据认证、轮换、吊销、连接会话、心跳保活、MQTT 风格主题订阅、发布（QoS 0 与 QoS 1）、拉取、重投与确认、设备影子的期望/实际状态写入、差异计算、版本冲突与会话鉴权，以及规则引擎的创建、列表、启停、删除、字段校验、条件评估与动作投递（含顺序、QoS、不递归触发、回放不触发）的成功与失败语义；另覆盖 `clean_start` 持久会话的建连与重连、订阅与确认历史保留、离线 QoS 1 队列（QoS 0 不保存、多过滤器去重、顺序、`dup` 与 `delivery_id` 语义、规则动作入队）、重连不回放保留消息而在线新订阅仍回放、`clean_start` 为 `true` 清空、非布尔值 `400` 且无副作用、设备吊销清除与凭据轮换保留。
