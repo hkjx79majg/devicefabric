@@ -56,10 +56,32 @@ PYTHONPATH=src python3 -m devicefabric.server --host 127.0.0.1 --port 8080
 - 乐观并发：提供 `expected_version` 时，其值必须为非负整数且等于写入前的 `version`，否则返回 `409`（`shadow_version_conflict`）且影子不变；不提供时不做版本检查。并发的相同预期版本写入至多一个成功。
 - 非 JSON 对象、缺少必填字段（desired 为 `state`，reported 为 `session_token`、`state`）、含未知字段、`state` 不是 JSON 对象或 `expected_version` 非法（非非负整数，含布尔值）均返回 `400`（`invalid_request`），影子不变。
 
+## 规则引擎
+
+规则仅保存在当前进程内，服务重启即清空。设备吊销、凭据轮换或会话离线均不删除规则。
+
+- `POST /v1/rules`：请求体为 `{"rule_id": ..., "topic_filter": ..., "enabled": ..., "condition": ..., "action": ...}`，五个字段均必填且不得含未知字段。`rule_id` 沿用 `device_id` 标识规则（1-64 个 ASCII 字母、数字、点、下划线或短横线）且在进程内唯一，重复返回 `409`（`rule_already_exists`）；`topic_filter` 沿用订阅过滤器语义；`enabled` 必须是 JSON 布尔值。成功返回 `201` 与完整规则。
+  - `condition` 为 `{"path": ..., "operator": ..., "value": ...}`，三个字段必填。`path` 为 1 至 16 个非空字符串组成的数组，从发布 payload 顶层逐层下钻；`operator` 仅支持 `eq`、`ne`、`gt`、`gte`、`lt`、`lte`。大小比较（后四者）的 `value` 必须是非布尔数字，否则创建返回 `400`；`eq`/`ne` 的 `value` 允许任意 JSON 值。
+  - `action` 为 `{"topic": ..., "payload": ..., "qos": ...}`，三个字段必填。`topic` 为合法固定 topic（沿用发布主题规则，不得含通配符或空层）；`payload` 为任意 JSON 值（创建后与规则绑定，触发时深拷贝生成消息）；`qos` 仅接受整数 `0` 或 `1`，与原发布消息的 QoS 无关。
+- `GET /v1/rules`：返回 `200 {"rules": [...]}`，按创建顺序列出全部规则（含已禁用与已启用）；无规则时返回 `{"rules": []}`。
+- `PUT /v1/rules/{rule_id}/enabled`：请求体只接受 `{"enabled": true}` 或 `{"enabled": false}`，多余字段、缺失字段或非布尔值均返回 `400`（`invalid_request`）。成功返回 `200` 与更新后的完整规则；规则不存在返回 `404`（`rule_not_found`）。
+- `DELETE /v1/rules/{rule_id}`：删除规则并保持其余规则的相对顺序，返回 `200 {"deleted": true}`；规则不存在返回 `404`（`rule_not_found`）。
+
+### 规则评估语义
+
+在线会话发布通过全部字段校验、会话鉴权与保活检查后，系统按创建顺序评估当时全部已启用规则；未通过校验或鉴权（含未知会话、令牌错误、会话离线、非法主题、非法 qos/retain 等）时不评估任何规则。对每条规则，当发布 topic 命中 `topic_filter` 且 `condition` 命中 payload 时，以 `action` 的 `topic`/`payload`/`qos`、原发布设备的 `publisher_device_id` 和一个全新唯一的 `message_id` 生成一条普通非保留实时消息（携带当前 UTC RFC 3339 的 `published_at`，不携带 `retained` 字段），按现有订阅匹配、QoS、delivery_id、背压重投与确认语义投递给当时在线的会话。
+
+- 原消息先于全部动作消息入队；同一次发布命中多条规则时，每条规则各生成一条消息，并按规则创建顺序入队。
+- 动作消息不再触发任何规则（即使其 topic 命中某条规则的过滤器），动作投递不计入发布响应的 `matched_count`，发布响应的 `message_id` 与 `matched_count` 口径保持不变。
+- 条件读取：`path` 任一段在 payload 中缺失，或下钻途中遇到非对象值（数组、标量或 null）即不命中；读取到的终点值允许任意 JSON 类型。`eq`/`ne` 按 JSON 值深度比较（对象按键与值递归、数组逐项比较，布尔值不与数字相等）；大小比较仅在读取值也是非布尔数字时进行，否则不命中。
+- 禁用中的规则不参与评估；重新启用后立即生效。保留消息回放（新订阅时的快照回放）不触发规则；带 `retain: true` 的实时发布仍正常评估规则，但其动作消息为普通非保留消息，不写入保留存储。
+
+非 JSON 对象、字段缺失或多余、`rule_id`/`topic_filter`/`enabled`/`condition`/`action` 任一非法均返回 `400`（`invalid_request`），且不改变任何规则或消息队列。错误体统一为 `{"error": {"code": ..., "message": ...}}`。
+
 ## 验证
 
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-当前测试覆盖健康检查基线与设备注册、凭据认证、轮换、吊销、连接会话、心跳保活、MQTT 风格主题订阅、发布（QoS 0 与 QoS 1）、拉取、重投与确认，以及设备影子的期望/实际状态写入、差异计算、版本冲突与会话鉴权的成功与失败语义。规则引擎仍留待后续任务从已冻结事实出发独立设计并验证。
+当前测试覆盖健康检查基线与设备注册、凭据认证、轮换、吊销、连接会话、心跳保活、MQTT 风格主题订阅、发布（QoS 0 与 QoS 1）、拉取、重投与确认、设备影子的期望/实际状态写入、差异计算、版本冲突与会话鉴权，以及规则引擎的创建、列表、启停、删除、字段校验、条件评估与动作投递（含顺序、QoS、不递归触发、回放不触发）的成功与失败语义。
