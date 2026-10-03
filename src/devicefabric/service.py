@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import copy
 import hmac
 import re
 import secrets
@@ -189,6 +190,10 @@ class Service:
         # 记录各 topic 最近一次保留发布的先后顺序，供订阅回放排序。
         self._retained: dict[str, dict] = {}
         self._retained_sequence = 0
+        # 设备影子：device_id -> {"version", "desired", "reported",
+        # "updated_at"}。注册时初始化，仅存在当前进程内；吊销、凭据轮换
+        # 或会话离线都不删除。
+        self._shadows: dict[str, dict] = {}
 
     def health(self) -> dict[str, str]:
         return {"status": "ok", "service": self.name, "version": self.version}
@@ -240,6 +245,14 @@ class Service:
                 "credential": credential,
             }
             self._devices[device_id] = device
+            # 注册即初始化空影子：version 为 0、三个状态为空对象、
+            # updated_at 为 None。
+            self._shadows[device_id] = {
+                "version": 0,
+                "desired": {},
+                "reported": {},
+                "updated_at": None,
+            }
             result = self._public_device(device)
             result["credential"] = credential
             return result
@@ -765,3 +778,142 @@ class Service:
                     acked.add(delivery_id)
                     acked_count += 1
             return {"acked_count": acked_count}
+
+    # ------------------------------------------------------------------
+    # 设备影子：期望状态、实际状态与差异
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _shadow_snapshot_locked(device_id: str, shadow: dict) -> dict:
+        """影子完整快照；深拷贝避免调用方修改进程内状态。"""
+        return {
+            "device_id": device_id,
+            "version": shadow["version"],
+            "desired": copy.deepcopy(shadow["desired"]),
+            "reported": copy.deepcopy(shadow["reported"]),
+            "delta": Service._shadow_delta_locked(
+                shadow["desired"], shadow["reported"]
+            ),
+            "updated_at": shadow["updated_at"],
+        }
+
+    @staticmethod
+    def _shadow_delta_locked(desired: object, reported: object) -> dict:
+        """递归保留 desired 中 reported 缺失或值不同的成员。
+
+        仅当两侧均为 JSON 对象时才向下递归；数组与其他非对象值整体比较。
+        reported 独有的成员一律忽略；完全一致时返回空对象。
+        """
+        if not isinstance(desired, dict) or not isinstance(reported, dict):
+            return {}
+        delta: dict = {}
+        for key, desired_value in desired.items():
+            if key not in reported:
+                delta[key] = copy.deepcopy(desired_value)
+                continue
+            reported_value = reported[key]
+            if isinstance(desired_value, dict) and isinstance(reported_value, dict):
+                nested = Service._shadow_delta_locked(desired_value, reported_value)
+                if nested:
+                    delta[key] = nested
+            elif desired_value != reported_value:
+                delta[key] = copy.deepcopy(desired_value)
+        return delta
+
+    @staticmethod
+    def _validate_shadow_state(value: object) -> dict:
+        if not isinstance(value, dict):
+            raise ServiceError("state must be a JSON object")
+        return value
+
+    @staticmethod
+    def _validate_expected_version(value: object) -> int:
+        # bool 是 int 的子类，须显式排除；只接受非负整数。
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ServiceError("expected_version must be a non-negative integer")
+        return value
+
+    def get_shadow(self, device_id: str) -> dict:
+        with self._lock:
+            shadow = self._shadows.get(device_id)
+            if shadow is None:
+                raise ServiceError(
+                    f"device {device_id!r} not found",
+                    code="device_not_found",
+                    status=404,
+                )
+            return self._shadow_snapshot_locked(device_id, shadow)
+
+    def set_desired_shadow(self, device_id: str, payload: object) -> dict:
+        data = self._require_fields(
+            payload, {"state"}, optional={"expected_version"}
+        )
+        state = self._validate_shadow_state(data["state"])
+        expected_version = None
+        if "expected_version" in data:
+            expected_version = self._validate_expected_version(
+                data["expected_version"]
+            )
+
+        with self._lock:
+            shadow = self._shadows.get(device_id)
+            if shadow is None:
+                raise ServiceError(
+                    f"device {device_id!r} not found",
+                    code="device_not_found",
+                    status=404,
+                )
+            # 已吊销设备仍可读写 desired，此处不检查 active。
+            if expected_version is not None and expected_version != shadow["version"]:
+                raise ServiceError(
+                    f"shadow version conflict: expected {expected_version}, "
+                    f"current {shadow['version']}",
+                    code="shadow_version_conflict",
+                    status=409,
+                )
+            shadow["desired"] = copy.deepcopy(state)
+            shadow["version"] += 1
+            shadow["updated_at"] = _rfc3339_utc(_utc_now())
+            return self._shadow_snapshot_locked(device_id, shadow)
+
+    def report_shadow(self, session_id: str, payload: object) -> dict:
+        data = self._require_fields(
+            payload, {"session_token", "state"}, optional={"expected_version"}
+        )
+        token = data["session_token"]
+        if not isinstance(token, str) or isinstance(token, bool):
+            raise ServiceError("session_token must be a string")
+        state = self._validate_shadow_state(data["state"])
+        expected_version = None
+        if "expected_version" in data:
+            expected_version = self._validate_expected_version(
+                data["expected_version"]
+            )
+
+        with self._lock:
+            now = _utc_now()
+            # 沿用会话鉴权及超时规则：未知 404、令牌错误 401、
+            # 关闭或过期 409。
+            session = self._authenticate_online_session_locked(
+                session_id, token, now
+            )
+            device_id = session["device_id"]
+            shadow = self._shadows.get(device_id)
+            if shadow is None:
+                # 在线会话必然伴随已注册设备与影子，仅作防御性处理。
+                raise ServiceError(
+                    f"device {device_id!r} not found",
+                    code="device_not_found",
+                    status=404,
+                )
+            if expected_version is not None and expected_version != shadow["version"]:
+                raise ServiceError(
+                    f"shadow version conflict: expected {expected_version}, "
+                    f"current {shadow['version']}",
+                    code="shadow_version_conflict",
+                    status=409,
+                )
+            shadow["reported"] = copy.deepcopy(state)
+            shadow["version"] += 1
+            shadow["updated_at"] = _rfc3339_utc(now)
+            return self._shadow_snapshot_locked(device_id, shadow)

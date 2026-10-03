@@ -45,10 +45,21 @@ PYTHONPATH=src python3 -m devicefabric.server --host 127.0.0.1 --port 8080
 
 四个入口对未知会话返回 `404`（`session_not_found`），令牌错误返回 `401`（`invalid_session_token`），令牌正确但会话已 `closed` 或 `expired` 返回 `409`（`session_not_online`）。路由前按既有保活规则处理超时，且只投递给在线会话。非 JSON 对象、字段缺失或多余、非法主题/过滤器、非法 `max_messages`、非法 `qos`、非法 `retain` 或非法 `delivery_ids` 均返回 `400`（`invalid_request`），且不改变订阅、队列、未确认集合、消费位置或保留状态。会话因超时、重连替换或设备吊销离线后，其订阅、待首次投递消息、未确认消息与确认历史立即失效，新会话不继承，也不保存离线消息；不同会话之间的确认状态互不影响。
 
+## 设备影子
+
+影子仅保存在当前进程内，服务重启即清空。设备注册时初始化空影子；吊销、凭据轮换或会话离线均不删除影子，现有入口行为不变。
+
+- `GET /v1/devices/{device_id}/shadow`：返回 `200` 与完整快照 `{"device_id", "version", "desired", "reported", "delta", "updated_at"}`。初始 `version` 为 `0`，`desired`、`reported`、`delta` 均为空对象，`updated_at` 为 `null`。设备不存在返回 `404`（`device_not_found`），已吊销设备仍可读取。
+- `PUT /v1/devices/{device_id}/shadow/desired`：请求体为 `{"state": {...}}`，可选 `expected_version`（非负整数）。整体替换 `desired`（非合并），返回 `200` 与写入后的完整快照。每次写入 `version` 加一、`updated_at` 更新为当前 UTC RFC 3339 时间；即使新 `state` 与现有值完全相同、或写入空对象也照常递增。设备不存在返回 `404`（`device_not_found`）；已吊销设备仍可写入。
+- `POST /v1/device-sessions/{session_id}/shadow/reported`：请求体为 `{"session_token": ..., "state": {...}}`，可选 `expected_version`。沿用会话鉴权与保活超时规则：未知会话 `404`（`session_not_found`）、令牌错误 `401`（`invalid_session_token`）、会话已 `closed` 或 `expired` 返回 `409`（`session_not_online`）。鉴权通过后整体替换该会话所属设备的 `reported`，返回 `200` 与完整快照，`version` 加一、`updated_at` 更新（`state` 相同也递增）。reported 仅可由归属该设备且在线的会话更新。
+- `delta` 递归计算：保留 `desired` 中 `reported` 缺失或值不同的成员，取值来自 `desired`；仅当两侧同名成员均为对象时向下递归，数组及其他非对象值整体比较；`reported` 独有的成员忽略；完全一致时 `delta` 为空对象。
+- 乐观并发：提供 `expected_version` 时，其值必须为非负整数且等于写入前的 `version`，否则返回 `409`（`shadow_version_conflict`）且影子不变；不提供时不做版本检查。并发的相同预期版本写入至多一个成功。
+- 非 JSON 对象、缺少必填字段（desired 为 `state`，reported 为 `session_token`、`state`）、含未知字段、`state` 不是 JSON 对象或 `expected_version` 非法（非非负整数，含布尔值）均返回 `400`（`invalid_request`），影子不变。
+
 ## 验证
 
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-当前测试覆盖健康检查基线与设备注册、凭据认证、轮换、吊销、连接会话、心跳保活以及 MQTT 风格主题订阅、发布（QoS 0 与 QoS 1）、拉取、重投与确认的成功与失败语义。影子状态与规则引擎仍留待后续任务从已冻结事实出发独立设计并验证。
+当前测试覆盖健康检查基线与设备注册、凭据认证、轮换、吊销、连接会话、心跳保活、MQTT 风格主题订阅、发布（QoS 0 与 QoS 1）、拉取、重投与确认，以及设备影子的期望/实际状态写入、差异计算、版本冲突与会话鉴权的成功与失败语义。规则引擎仍留待后续任务从已冻结事实出发独立设计并验证。
