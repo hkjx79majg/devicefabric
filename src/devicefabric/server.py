@@ -57,6 +57,13 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/v1/rules":
             self.handle_service_call(lambda: (200, self.service.list_rules()))
             return
+        command_ids = self._extract_device_command_ids(self.path)
+        if command_ids is not None:
+            device_id, command_id = command_ids
+            self.handle_service_call(
+                lambda: (200, self.service.get_command(device_id, command_id))
+            )
+            return
         device_id = self._extract_device_id(self.path, "/shadow")
         if device_id is not None:
             self.handle_service_call(lambda: (200, self.service.get_shadow(device_id)))
@@ -148,6 +155,27 @@ class Handler(BaseHTTPRequestHandler):
                 return 200, self.service.report_shadow(session_id, self.read_json_object())
             self.handle_service_call(action)
             return
+        session_id = self._extract_session_id(path, "/commands/poll")
+        if session_id is not None:
+            def action() -> tuple[int, dict]:
+                return 200, self.service.poll_commands(session_id, self.read_json_object())
+            self.handle_service_call(action)
+            return
+        ack_ids = self._extract_session_command_ack_ids(path)
+        if ack_ids is not None:
+            session_id, command_id = ack_ids
+            def action() -> tuple[int, dict]:
+                return 200, self.service.ack_command(
+                    session_id, command_id, self.read_json_object()
+                )
+            self.handle_service_call(action)
+            return
+        device_id = self._extract_device_id(path, "/commands")
+        if device_id is not None:
+            def action() -> tuple[int, dict]:
+                return 202, self.service.create_command(device_id, self.read_json_object())
+            self.handle_service_call(action)
+            return
         device_id = self._extract_device_id(path, "/credential/rotate")
         if device_id is not None:
             self.handle_service_call(lambda: (200, self.service.rotate_credential(device_id)))
@@ -201,6 +229,42 @@ class Handler(BaseHTTPRequestHandler):
         segment = path[len(prefix):end]
         if segment and all(ch.isascii() and (ch.isalnum() or ch in "._-") for ch in segment):
             return segment
+        return None
+
+    @staticmethod
+    def _valid_id_segment(segment: str) -> bool:
+        return bool(segment) and all(
+            ch.isascii() and (ch.isalnum() or ch in "._-") for ch in segment
+        )
+
+    @classmethod
+    def _extract_device_command_ids(cls, path: str) -> tuple[str, str] | None:
+        """匹配 /v1/devices/{device_id}/commands/{command_id}。"""
+        prefix = "/v1/devices/"
+        marker = "/commands/"
+        if not path.startswith(prefix) or marker not in path:
+            return None
+        device_segment, _, command_segment = path[len(prefix):].partition(marker)
+        if cls._valid_id_segment(device_segment) and cls._valid_id_segment(command_segment):
+            return device_segment, command_segment
+        return None
+
+    @classmethod
+    def _extract_session_command_ack_ids(cls, path: str) -> tuple[str, str] | None:
+        """匹配 /v1/device-sessions/{session_id}/commands/{command_id}/ack。"""
+        prefix = "/v1/device-sessions/"
+        marker = "/commands/"
+        suffix = "/ack"
+        if (
+            not path.startswith(prefix)
+            or not path.endswith(suffix)
+            or marker not in path
+        ):
+            return None
+        middle = path[len(prefix):len(path) - len(suffix)]
+        session_segment, _, command_segment = middle.partition(marker)
+        if cls._valid_id_segment(session_segment) and cls._valid_id_segment(command_segment):
+            return session_segment, command_segment
         return None
 
     def log_message(self, fmt: str, *args: object) -> None:

@@ -86,10 +86,22 @@ PYTHONPATH=src python3 -m devicefabric.server --host 127.0.0.1 --port 8080
 
 非 JSON 对象、字段缺失或多余、`rule_id`/`topic_filter`/`enabled`/`condition`/`action` 任一非法均返回 `400`（`invalid_request`），且不改变任何规则或消息队列。错误体统一为 `{"error": {"code": ..., "message": ...}}`。
 
+## 设备命令
+
+命令仅保存在当前进程内，服务重启即清空。凭据轮换不影响命令；设备吊销时全部非终态命令变为 `cancelled`，已终态命令不变。
+
+- `POST /v1/devices/{device_id}/commands`：请求体为 `{"command_name": ..., "payload": ..., "ttl_seconds": ...}`，三个字段均必填且不得含未知字段。`command_name` 沿用 `device_id` 标识规则（1-64 个 ASCII 字母、数字、点、下划线或短横线）；`payload` 可为任意 JSON 值；`ttl_seconds` 为 5 至 86400 的整数。成功返回 `202` 与命令完整快照：唯一不可预测的 `command_id`、`queued` 状态、`delivery_count` 为 `0`、`created_at` 与 `expires_at`（UTC RFC 3339）、`completed_at` 与 `result` 为 `null`。设备不存在返回 `404`（`device_not_found`），已吊销返回 `409`（`device_revoked`）。
+- `POST /v1/device-sessions/{session_id}/commands/poll`：请求体为 `{"session_token": ..., "max_commands": ...}`，`max_commands` 为 1 至 100 的整数。在线会话按创建顺序领取本设备命令，返回 `200 {"commands": [...]}`，每项在完整快照之外携带 `dup`。首次领取将状态改为 `delivered`、`delivery_count` 置一且 `dup` 为 `false`；确认前由同一会话重领时计数不变、`dup` 为 `true`。领取会话超时或被替换后，另一在线会话可重领，`delivery_count` 加一且 `dup` 为 `true`；仍归属其他在线会话的命令不可领取，并发领取不会双重归属。终态命令不再领取。
+- `POST /v1/device-sessions/{session_id}/commands/{command_id}/ack`：请求体为 `{"session_token": ..., "status": ..., "result": ...}`，`status` 只接受 `succeeded` 或 `failed`，`result` 可为任意 JSON 值。首次确认只接受当前领取会话，保存终态、结果与 `completed_at` 并返回 `200` 完整快照；相同确认幂等返回 `200`，内容冲突返回 `409`（`command_already_completed`），未投递（含投递给其他会话）返回 `409`（`command_not_delivered`），命令不存在或属于其他设备返回 `404`（`command_not_found`）。
+- `GET /v1/devices/{device_id}/commands/{command_id}`：返回 `200` 与完整快照；设备不存在返回 `404`（`device_not_found`），命令不存在或属于其他设备返回 `404`（`command_not_found`）。
+- 到达 `expires_at` 的非终态命令在读取、领取或确认时转为 `expired`，不再可领取，确认返回 `409`（`command_expired`）。
+
+轮询与确认沿用现有会话鉴权及保活语义：未知会话 `404`（`session_not_found`）、令牌错误 `401`（`invalid_session_token`）、会话已 `closed` 或 `expired` 返回 `409`（`session_not_online`）。非 JSON 对象、字段缺失或多余、`command_name`/`ttl_seconds`/`max_commands`/`status` 非法均返回 `400`（`invalid_request`），且不改变任何命令状态。
+
 ## 验证
 
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-当前测试覆盖健康检查基线与设备注册、凭据认证、轮换、吊销、连接会话、心跳保活、MQTT 风格主题订阅、发布（QoS 0 与 QoS 1）、拉取、重投与确认、设备影子的期望/实际状态写入、差异计算、版本冲突与会话鉴权，以及规则引擎的创建、列表、启停、删除、字段校验、条件评估与动作投递（含顺序、QoS、不递归触发、回放不触发）的成功与失败语义；另覆盖 `clean_start=false` 持久会话的建立、离线 QoS 1 队列、每组合一份与独立 delivery_id、`matched_count` 口径、重连后的顺序与 dup 重投、确认历史、保留消息不回放、`clean_start=true` 清状态、非布尔值拒绝且无副作用，以及凭据轮换保留与设备吊销清除。
+当前测试覆盖健康检查基线与设备注册、凭据认证、轮换、吊销、连接会话、心跳保活、MQTT 风格主题订阅、发布（QoS 0 与 QoS 1）、拉取、重投与确认、设备影子的期望/实际状态写入、差异计算、版本冲突与会话鉴权，以及规则引擎的创建、列表、启停、删除、字段校验、条件评估与动作投递（含顺序、QoS、不递归触发、回放不触发）的成功与失败语义；另覆盖 `clean_start=false` 持久会话的建立、离线 QoS 1 队列、每组合一份与独立 delivery_id、`matched_count` 口径、重连后的顺序与 dup 重投、确认历史、保留消息不回放、`clean_start=true` 清状态、非布尔值拒绝且无副作用，以及凭据轮换保留与设备吊销清除；并覆盖设备命令的下发、按创建顺序领取、dup 重领、归属转移、确认与幂等、过期与吊销取消、字段校验与会话鉴权语义。
