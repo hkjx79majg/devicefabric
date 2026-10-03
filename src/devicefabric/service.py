@@ -299,6 +299,21 @@ class Service:
         # 均不删除规则。
         self._rules: dict[str, dict] = {}
         self._rule_order: list[str] = []
+        # 进程内持久会话：(device_id, client_id) -> 持久路由状态容器。
+        # 仅由 clean_start=false 的连接创建；会话离线（超时、重连替换、
+        # 吊销）后容器仍保留，直至同组合 clean_start=true 重连或设备吊销。
+        # 进程重启即清空。
+        self._persistent_sessions: dict[tuple[str, str], dict] = {}
+
+    @staticmethod
+    def _new_routes_locked() -> dict:
+        """一份路由状态：订阅过滤器集合、待取队列、未确认投递与确认历史。"""
+        return {
+            "subscriptions": set(),
+            "queue": deque(),
+            "unacked": {},
+            "acked": set(),
+        }
 
     def health(self) -> dict[str, str]:
         return {"status": "ok", "service": self.name, "version": self.version}
@@ -441,6 +456,11 @@ class Service:
             for key, session_id in list(self._online_session_keys.items()):
                 if key[0] == device_id:
                     self._close_session_locked(self._sessions[session_id], "device_revoked")
+            # 同时清除该设备的全部持久会话状态（订阅、离线队列、未确认
+            # 投递与确认历史）；凭据轮换不触发本路径。
+            for key in list(self._persistent_sessions):
+                if key[0] == device_id:
+                    del self._persistent_sessions[key]
             return self._public_device(device)
 
     # ------------------------------------------------------------------
@@ -475,6 +495,27 @@ class Service:
         self._issued_session_tokens.add(token)
         return token
 
+    def _detach_routes_locked(self, session: dict) -> None:
+        """会话离线时的路由状态收尾。
+
+        临时会话：订阅、待取消息、未确认投递与确认历史立即失效，且不被
+        新会话继承。持久会话：订阅与 QoS 1 待投递/未确认/确认历史随共享
+        容器保留，但 QoS 0 不属于持久会话状态（含尚未拉取的 QoS 0 保留
+        回放），离线时丢弃，等待同组合以 clean_start=false 重连。
+        """
+        if not session.get("persistent"):
+            routes = session["routes"]
+            routes["subscriptions"].clear()
+            routes["queue"].clear()
+            routes["unacked"].clear()
+            routes["acked"].clear()
+            return
+        routes = session["routes"]
+        routes["queue"] = deque(
+            entry for entry in routes["queue"] if entry["qos"] == 1
+        )
+        session["queue"] = routes["queue"]
+
     def _expire_if_timed_out_locked(self, session: dict, now: datetime) -> bool:
         """在线会话超过 expires_at 即转为 expired，不可恢复。"""
         if session["state"] == SESSION_ONLINE and now > session["expires_at"]:
@@ -483,7 +524,7 @@ class Service:
             self._online_session_keys.pop(
                 (session["device_id"], session["client_id"]), None
             )
-            self._discard_session_routes_locked(session)
+            self._detach_routes_locked(session)
             return True
         return False
 
@@ -493,20 +534,14 @@ class Service:
         self._online_session_keys.pop(
             (session["device_id"], session["client_id"]), None
         )
-        self._discard_session_routes_locked(session)
-
-    @staticmethod
-    def _discard_session_routes_locked(session: dict) -> None:
-        """会话离线后订阅、待取消息、未确认投递与确认历史立即失效，且不被新会话继承。"""
-        session["subscriptions"].clear()
-        session["queue"].clear()
-        session["unacked"].clear()
-        session["acked"].clear()
+        self._detach_routes_locked(session)
 
     def create_session(self, payload: object) -> dict:
         if not isinstance(payload, dict):
             raise ServiceError("request body must be a JSON object")
-        unknown = set(payload) - {"device_id", "credential", "client_id", "keepalive_seconds"}
+        unknown = set(payload) - {
+            "device_id", "credential", "client_id", "keepalive_seconds", "clean_start"
+        }
         if unknown:
             raise ServiceError(f"unknown field(s): {', '.join(sorted(unknown))}")
         for field in ("device_id", "credential", "client_id", "keepalive_seconds"):
@@ -518,6 +553,11 @@ class Service:
         if not isinstance(credential, str):
             raise ServiceError("credential must be a string")
         keepalive = _validate_keepalive(payload["keepalive_seconds"])
+        # 缺省或显式 true：沿用既有临时会话；仅显式 JSON 布尔值可被接受，
+        # 非布尔值在触碰任何会话状态之前即拒绝。
+        clean_start = payload.get("clean_start", True)
+        if not isinstance(clean_start, bool):
+            raise ServiceError("clean_start must be a boolean")
 
         with self._lock:
             device = self._devices.get(device_id)
@@ -542,6 +582,18 @@ class Service:
                 # 否则标记为被新会话取代。
                 if not self._expire_if_timed_out_locked(previous, now):
                     self._close_session_locked(previous, "replaced")
+            if clean_start:
+                # 临时会话不继承任何状态；同组合此前的持久状态全部丢弃。
+                self._persistent_sessions.pop(key, None)
+                routes = self._new_routes_locked()
+                persistent = False
+            else:
+                # 复用该组合的持久路由状态；首次连接时建立空状态。
+                routes = self._persistent_sessions.get(key)
+                if routes is None:
+                    routes = self._new_routes_locked()
+                    self._persistent_sessions[key] = routes
+                persistent = True
             session = {
                 "session_id": self._mint_session_id_locked(),
                 "token": self._mint_session_token_locked(),
@@ -553,12 +605,16 @@ class Service:
                 "expires_at": now + timedelta(seconds=keepalive),
                 "state": SESSION_ONLINE,
                 "reason": None,
+                # 持久会话与离线容器共享同一份路由状态；临时会话持有
+                # 仅本会话可见的独立状态。
+                "persistent": persistent,
+                "routes": routes,
                 # 订阅过滤器集合（幂等、无副本）与待取消息队列。
-                "subscriptions": set(),
-                "queue": deque(),
+                "subscriptions": routes["subscriptions"],
+                "queue": routes["queue"],
                 # QoS 1 已投递未确认的投递记录（按首次投递顺序）与已确认历史。
-                "unacked": {},
-                "acked": set(),
+                "unacked": routes["unacked"],
+                "acked": routes["acked"],
             }
             self._sessions[session["session_id"]] = session
             self._online_session_keys[key] = session["session_id"]
@@ -791,15 +847,18 @@ class Service:
         """把一条普通非保留消息投递给当时匹配的在线会话。
 
         返回实际入队的在线会话数。沿用既有超时判定、订阅匹配、每会话一份、
-        QoS 与 delivery_id 语义。
+        QoS 与 delivery_id 语义。无在线会话的持久组合若订阅匹配，QoS 1
+        消息另存一份到其离线队列（QoS 0 不保存），但不计入返回计数。
         """
         topic_layers = _split_topic_layers(topic)
         matched = 0
+        online_keys: set[tuple[str, str]] = set()
         for target in self._sessions.values():
             # 路由前按既有保活规则处理超时，只投递给在线会话。
             self._expire_if_timed_out_locked(target, now)
             if target["state"] != SESSION_ONLINE:
                 continue
+            online_keys.add((target["device_id"], target["client_id"]))
             if not any(
                 _topic_matches_filter(topic_layers, _split_topic_layers(sub))
                 for sub in target["subscriptions"]
@@ -813,6 +872,24 @@ class Service:
                 entry["delivery_id"] = self._mint_delivery_id_locked()
             target["queue"].append(entry)
             matched += 1
+        # 离线持久会话只保存 QoS 1；每个持久组合即使多个过滤器命中也只
+        # 一份，delivery_id 独立于在线投递，且不计入 matched_count。
+        if qos == 1:
+            for key, routes in self._persistent_sessions.items():
+                if key in online_keys:
+                    continue
+                if not any(
+                    _topic_matches_filter(topic_layers, _split_topic_layers(sub))
+                    for sub in routes["subscriptions"]
+                ):
+                    continue
+                routes["queue"].append(
+                    {
+                        "qos": 1,
+                        "message": message,
+                        "delivery_id": self._mint_delivery_id_locked(),
+                    }
+                )
         return matched
 
     def _evaluate_rules_locked(
