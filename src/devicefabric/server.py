@@ -89,6 +89,13 @@ class Handler(BaseHTTPRequestHandler):
         if device_id is not None:
             self.handle_service_call(lambda: (200, self.service.get_shadow(device_id)))
             return
+        telemetry = self._extract_device_telemetry_query(self.path)
+        if telemetry is not None:
+            device_id, query = telemetry
+            self.handle_service_call(
+                lambda: (200, self.service.query_telemetry(device_id, query))
+            )
+            return
         device_id = self._extract_device_id(self.path)
         if device_id is not None:
             self.handle_service_call(lambda: (200, self.service.get_device(device_id)))
@@ -204,6 +211,12 @@ class Handler(BaseHTTPRequestHandler):
                 return 200, self.service.report_shadow(session_id, self.read_json_object())
             self.handle_service_call(action)
             return
+        session_id = self._extract_session_id(path, "/telemetry")
+        if session_id is not None:
+            def action() -> tuple[int, dict]:
+                return 202, self.service.submit_telemetry(session_id, self.read_json_object())
+            self.handle_service_call(action)
+            return
         session_id = self._extract_session_id(path, "/commands/poll")
         if session_id is not None:
             def action() -> tuple[int, dict]:
@@ -275,6 +288,19 @@ class Handler(BaseHTTPRequestHandler):
         segment = path[len(prefix):end]
         if segment and all(ch.isascii() and (ch.isalnum() or ch in "._-") for ch in segment):
             return segment
+        return None
+
+    @staticmethod
+    def _extract_device_telemetry_query(path: str) -> tuple[str, str] | None:
+        """匹配 /v1/devices/{device_id}/telemetry[?query]，返回设备与查询串。"""
+        prefix = "/v1/devices/"
+        suffix = "/telemetry"
+        bare, _, query = path.partition("?")
+        if not bare.startswith(prefix) or not bare.endswith(suffix):
+            return None
+        segment = bare[len(prefix):len(bare) - len(suffix)]
+        if segment and all(ch.isascii() and (ch.isalnum() or ch in "._-") for ch in segment):
+            return segment, query
         return None
 
     @staticmethod
