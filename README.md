@@ -117,10 +117,22 @@ PYTHONPATH=src python3 -m devicefabric.server --host 127.0.0.1 --port 8080
 
 设备吊销按既有规则取消批次中的非终态子命令，已终态子命令不变；子命令到达 `expires_at` 时在批次查询中按既有规则转为 `expired`。非 JSON 对象、缺失或未知字段、重复成员、非法 `group_id`/`device_ids`/版本/`request_id`/命令字段均返回 `400`（`invalid_request`）且状态不变，错误体沿用 `{"error": {"code": ..., "message": ...}}`。
 
+## 时序遥测
+
+遥测的持久化位置由环境变量 `DEVICEFABRIC_TELEMETRY_PATH` 指定：未配置时数据仅保存在当前进程内，进程结束即清空；配置后已受理的数据点与幂等记录追加写入该文件（JSONL），跨重启保留。凭据轮换、会话离线或设备吊销均不删除遥测。
+
+- `POST /v1/device-sessions/{session_id}/telemetry`：请求体为 `{"session_token": ..., "request_id": ..., "points": [...]}`，三个字段均必填且不得含未知字段。`request_id` 为 1-64 个字符的非空字符串；`points` 含 1 至 500 项，每项仅含 `metric`、`timestamp`、`value` 三个必填字段：`metric` 沿用 `device_id` 标识规则（1-64 个 ASCII 字母、数字、点、下划线或短横线）；`timestamp` 必须是带时区的 RFC 3339 时间，按 UTC 保存；`value` 为非布尔的有限 JSON 数字。整批原子校验并写入，任一点非法则整批拒绝且不产生任何状态。成功返回 `202` 与 `{"request_id", "accepted_count"}`。
+  - 幂等：同一设备内相同 `request_id` 且内容（各点的 `metric`、按 UTC 规范化后的 `timestamp`、`value`，数值不区分 `1` 与 `1.0`）相同的重复请求返回原结果（HTTP `202`），不重复写入；内容不同返回 `409`（`telemetry_request_conflict`）。`request_id` 的作用域为单个设备，不同设备互不影响。
+  - 会话错误沿用既有语义：未知会话 `404`（`session_not_found`）、令牌错误 `401`（`invalid_session_token`）、会话已 `closed` 或 `expired` 返回 `409`（`session_not_online`）。非法请求返回 `400`（`invalid_request`）。配置了持久化位置但存储写入失败时返回 `503`（`telemetry_storage_unavailable`），该批数据与幂等记录均不可见。
+- `GET /v1/devices/{device_id}/telemetry?metric=...&start=...&end=...&resolution=...`：四个查询参数均必填且各出现一次，不得含未知参数。`start`、`end` 均为带时区的 RFC 3339 时间，区间包含 `start`、不包含 `end`，且 `start` 必须早于 `end`；`resolution` 仅接受 `raw`、`60`、`300`、`3600`。
+  - `raw`：按时间升序返回原始点（同时间按受理顺序排列），响应为 `200` 与 `{"device_id", "metric", "resolution", "points"}`，每个点为 `{"metric", "timestamp", "value"}`，`timestamp` 为 UTC RFC 3339。`raw` 查询区间最长 24 小时。
+  - 数值分辨率（`60`/`300`/`3600` 秒）：按 Unix 纪元对齐的固定窗口降采样，响应为 `200` 与 `{"device_id", "metric", "resolution", "windows"}`；仅返回非空窗口，按窗口起始升序，每项含 UTC 起始时间 `start` 及 `count`、`min`、`max`、`avg`、`last`，`last` 取窗口内最后一点（时间升序、同时间按受理顺序）。降采样查询区间最长 31 天。
+  - 参数非法或区间越界返回 `400`（`invalid_request`）；设备不存在返回 `404`（`device_not_found`），已吊销设备仍可查询；无数据返回 `200` 与空结果（`points` 或 `windows` 为空数组）。
+
 ## 验证
 
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-当前测试覆盖健康检查基线与设备注册、凭据认证、轮换、吊销、连接会话、心跳保活、MQTT 风格主题订阅、发布（QoS 0 与 QoS 1）、拉取、重投与确认、设备影子的期望/实际状态写入、差异计算、版本冲突与会话鉴权，以及规则引擎的创建、列表、启停、删除、字段校验、条件评估与动作投递（含顺序、QoS、不递归触发、回放不触发）的成功与失败语义；另覆盖 `clean_start=false` 持久会话的建立、离线 QoS 1 队列、每组合一份与独立 delivery_id、`matched_count` 口径、重连后的顺序与 dup 重投、确认历史、保留消息不回放、`clean_start=true` 清状态、非布尔值拒绝且无副作用，以及凭据轮换保留与设备吊销清除；并覆盖设备命令的下发、按创建顺序领取、dup 重领、归属转移、确认与幂等、过期与吊销取消、字段校验与会话鉴权语义；另覆盖设备组的创建、查询、整体替换、乐观版本与各类冲突（含重名、版本不符、组/设备不存在、重复或非法成员、吊销不移除成员），以及组命令批次的成员快照下发、空组零项批次、不可预测 batch_id、按成员顺序的结果、expected_group_version 冲突、含吊销成员整体拒绝、同组 request_id 幂等与内容冲突、并发至多一个批次、批次查询的子命令当前快照与六状态汇总、成员变化不影响旧批次、吊销按既有规则取消非终态子命令，以及子命令经既有轮询/重领/确认/单命令查询入口处理的端到端语义。
+当前测试覆盖健康检查基线与设备注册、凭据认证、轮换、吊销、连接会话、心跳保活、MQTT 风格主题订阅、发布（QoS 0 与 QoS 1）、拉取、重投与确认、设备影子的期望/实际状态写入、差异计算、版本冲突与会话鉴权，以及规则引擎的创建、列表、启停、删除、字段校验、条件评估与动作投递（含顺序、QoS、不递归触发、回放不触发）的成功与失败语义；另覆盖 `clean_start=false` 持久会话的建立、离线 QoS 1 队列、每组合一份与独立 delivery_id、`matched_count` 口径、重连后的顺序与 dup 重投、确认历史、保留消息不回放、`clean_start=true` 清状态、非布尔值拒绝且无副作用，以及凭据轮换保留与设备吊销清除；并覆盖设备命令的下发、按创建顺序领取、dup 重领、归属转移、确认与幂等、过期与吊销取消、字段校验与会话鉴权语义；另覆盖设备组的创建、查询、整体替换、乐观版本与各类冲突（含重名、版本不符、组/设备不存在、重复或非法成员、吊销不移除成员），以及组命令批次的成员快照下发、空组零项批次、不可预测 batch_id、按成员顺序的结果、expected_group_version 冲突、含吊销成员整体拒绝、同组 request_id 幂等与内容冲突、并发至多一个批次、批次查询的子命令当前快照与六状态汇总、成员变化不影响旧批次、吊销按既有规则取消非终态子命令，以及子命令经既有轮询/重领/确认/单命令查询入口处理的端到端语义；并覆盖时序遥测的批量写入与原子校验、UTC 规范化、request_id 幂等与内容冲突、按设备隔离、会话错误语义、raw 查询的排序与区间边界、固定窗口降采样（纪元对齐、count/min/max/avg/last、空窗口省略）、区间长度限制、吊销设备可查询、凭据轮换不删数据，以及配置 `DEVICEFABRIC_TELEMETRY_PATH` 后的跨重启保留与存储失败时的 503 语义。

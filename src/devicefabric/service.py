@@ -1,14 +1,18 @@
 """Core service surface for DeviceFabric.
 
 除健康检查外，本模块实现设备注册与身份凭据生命周期（注册、查询、
-认证、轮换与吊销），以及进程内连接会话与心跳保活。所有数据仅保存
-在当前进程内，进程退出即清空。
+认证、轮换与吊销），以及进程内连接会话与心跳保活。除时序遥测外，
+所有数据仅保存在当前进程内，进程退出即清空；遥测在配置
+DEVICEFABRIC_TELEMETRY_PATH 时持久化到指定位置，可跨重启保留。
 """
 
 from __future__ import annotations
 
 import copy
 import hmac
+import json
+import math
+import os
 import re
 import secrets
 import threading
@@ -55,6 +59,17 @@ COMMAND_ACK_STATUSES = frozenset({"succeeded", "failed"})
 
 REQUEST_ID_MIN = 1
 REQUEST_ID_MAX = 64
+
+TELEMETRY_POINTS_MIN = 1
+TELEMETRY_POINTS_MAX = 500
+TELEMETRY_RESOLUTIONS = frozenset({"raw", "60", "300", "3600"})
+TELEMETRY_RAW_MAX_SPAN = timedelta(hours=24)
+TELEMETRY_DOWNSAMPLED_MAX_SPAN = timedelta(days=31)
+
+# RFC 3339 时间戳：完整日期时间、必须带时区偏移或 Z/z。
+_RFC3339_RE = re.compile(
+    r"\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-]\d{2}:\d{2})\Z"
+)
 
 
 class ServiceError(Exception):
@@ -261,6 +276,59 @@ def _is_json_number(value: object) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
+def _parse_rfc3339(value: object, field: str) -> datetime:
+    """解析带时区的 RFC 3339 时间戳，统一转为 UTC 的 aware datetime。"""
+    if not isinstance(value, str) or isinstance(value, bool):
+        raise ServiceError(f"{field} must be an RFC 3339 timestamp string")
+    if not _RFC3339_RE.match(value):
+        raise ServiceError(
+            f"{field} must be an RFC 3339 timestamp with timezone"
+        )
+    text = value
+    if text[-1] in ("Z", "z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        raise ServiceError(f"{field} must be a valid RFC 3339 timestamp")
+    return parsed.astimezone(timezone.utc)
+
+
+def _validate_telemetry_points(value: object) -> list[dict]:
+    """校验一批遥测点；返回含 UTC datetime 的规范化点列表。
+
+    每项仅允许 metric、timestamp、value 三个字段：metric 沿用设备标识
+    规则；timestamp 必须带时区并按 UTC 保存；value 为非布尔的有限
+    JSON 数字。整批原子校验，任一项非法则整批拒绝。
+    """
+    if not isinstance(value, list):
+        raise ServiceError("points must be an array")
+    if not TELEMETRY_POINTS_MIN <= len(value) <= TELEMETRY_POINTS_MAX:
+        raise ServiceError(
+            f"points must contain {TELEMETRY_POINTS_MIN}-{TELEMETRY_POINTS_MAX} items"
+        )
+    points: list[dict] = []
+    for item in value:
+        if not isinstance(item, dict):
+            raise ServiceError("each point must be a JSON object")
+        unknown = set(item) - {"metric", "timestamp", "value"}
+        if unknown:
+            raise ServiceError(f"unknown field(s): {', '.join(sorted(unknown))}")
+        for field in ("metric", "timestamp", "value"):
+            if field not in item:
+                raise ServiceError(f"missing required field: {field}")
+        metric = _validate_identifier(item["metric"], "metric")
+        timestamp = _parse_rfc3339(item["timestamp"], "timestamp")
+        point_value = item["value"]
+        if not _is_json_number(point_value):
+            raise ServiceError("value must be a non-boolean JSON number")
+        # 整数必然有限；浮点须排除 NaN 与无穷。
+        if isinstance(point_value, float) and not math.isfinite(point_value):
+            raise ServiceError("value must be a finite JSON number")
+        points.append({"metric": metric, "dt": timestamp, "value": point_value})
+    return points
+
+
 def _json_equal(left: object, right: object) -> bool:
     """按 JSON 值深度比较；不区分 int/float 的数值相等（1 与 1.0 相等）。
 
@@ -397,6 +465,19 @@ class Service:
         self._group_requests: dict[tuple[str, str], str] = {}
         # 记录本进程签发过的全部批次 ID，保证批次在进程内绝不重复。
         self._issued_batch_ids: set[str] = set()
+        # 时序遥测：device_id -> 按受理顺序排列的点记录列表。每项为
+        # {"metric", "dt", "value", "seq"}；seq 为全局单调递增的受理序号，
+        # 用于同时间戳点的排序与窗口内 last 的判定。凭据轮换、会话离线
+        # 与设备吊销均不删除遥测。
+        self._telemetry: dict[str, list[dict]] = {}
+        self._telemetry_seq = 0
+        # 遥测幂等索引：(device_id, request_id) -> {"points", "accepted_count"}；
+        # points 为规范化（UTC 时间字符串）后的点列表，用于内容比较。
+        self._telemetry_requests: dict[tuple[str, str], dict] = {}
+        # 配置 DEVICEFABRIC_TELEMETRY_PATH 时，受理的批次以 JSONL 追加到
+        # 该文件，数据与幂等记录可跨重启保留；未配置时仅保存于进程内。
+        self._telemetry_path = os.environ.get("DEVICEFABRIC_TELEMETRY_PATH") or None
+        self._load_telemetry_locked()
 
     @staticmethod
     def _new_routes_locked() -> dict:
@@ -1855,3 +1936,235 @@ class Service:
                     status=404,
                 )
             return self._public_batch_status_locked(batch, _utc_now())
+
+    # ------------------------------------------------------------------
+    # 时序遥测：写入、幂等与查询
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _canonical_telemetry_point(point: dict) -> dict:
+        """持久化与幂等比较用的规范点：时间统一为 UTC RFC 3339 字符串。"""
+        return {
+            "metric": point["metric"],
+            "timestamp": _rfc3339_utc(point["dt"]),
+            "value": point["value"],
+        }
+
+    def _load_telemetry_locked(self) -> None:
+        """启动时从 JSONL 持久化文件重建遥测数据与幂等记录。
+
+        文件按受理顺序每行一个批次记录；损坏或形状非法的行跳过。文件
+        不存在或不可读时按空数据处理。
+        """
+        path = self._telemetry_path
+        if path is None or not os.path.exists(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                lines = handle.readlines()
+        except OSError:
+            return
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(record, dict):
+                continue
+            device_id = record.get("device_id")
+            request_id = record.get("request_id")
+            raw_points = record.get("points")
+            if (
+                not isinstance(device_id, str)
+                or not isinstance(request_id, str)
+                or not isinstance(raw_points, list)
+            ):
+                continue
+            try:
+                points = _validate_telemetry_points(raw_points)
+            except ServiceError:
+                continue
+            canonical = [self._canonical_telemetry_point(p) for p in points]
+            self._telemetry_requests[(device_id, request_id)] = {
+                "points": canonical,
+                "accepted_count": len(points),
+            }
+            bucket = self._telemetry.setdefault(device_id, [])
+            for point in points:
+                self._telemetry_seq += 1
+                bucket.append(
+                    {
+                        "metric": point["metric"],
+                        "dt": point["dt"],
+                        "value": point["value"],
+                        "seq": self._telemetry_seq,
+                    }
+                )
+
+    def _persist_telemetry_batch_locked(self, record: dict) -> None:
+        """把已受理批次追加到持久化文件；失败抛 503 且内存状态不变。"""
+        if self._telemetry_path is None:
+            return
+        line = json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n"
+        try:
+            directory = os.path.dirname(os.path.abspath(self._telemetry_path))
+            os.makedirs(directory, exist_ok=True)
+            with open(self._telemetry_path, "a", encoding="utf-8") as handle:
+                handle.write(line)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except OSError:
+            raise ServiceError(
+                "telemetry storage unavailable",
+                code="telemetry_storage_unavailable",
+                status=503,
+            )
+
+    def submit_telemetry(self, session_id: str, payload: object) -> dict:
+        data = self._require_fields(
+            payload, {"session_token", "request_id", "points"}
+        )
+        token = data["session_token"]
+        if not isinstance(token, str) or isinstance(token, bool):
+            raise ServiceError("session_token must be a string")
+        request_id = _validate_request_id(data["request_id"])
+        # 整批原子校验：任一点非法则整批拒绝，不产生任何状态。
+        points = _validate_telemetry_points(data["points"])
+
+        with self._lock:
+            now = _utc_now()
+            # 沿用会话鉴权及保活规则：未知 404、令牌错误 401、已离线 409。
+            session = self._authenticate_online_session_locked(
+                session_id, token, now
+            )
+            device_id = session["device_id"]
+            canonical = [self._canonical_telemetry_point(p) for p in points]
+            key = (device_id, request_id)
+            existing = self._telemetry_requests.get(key)
+            if existing is not None:
+                # 同设备同 request_id：内容相同幂等返回原结果，不重复写入；
+                # 内容不同冲突。request_id 作用域为单个设备。
+                if _json_equal(existing["points"], canonical):
+                    return {
+                        "request_id": request_id,
+                        "accepted_count": existing["accepted_count"],
+                    }
+                raise ServiceError(
+                    f"request_id {request_id!r} already used with different content",
+                    code="telemetry_request_conflict",
+                    status=409,
+                )
+            record = {
+                "device_id": device_id,
+                "request_id": request_id,
+                "accepted_count": len(points),
+                "points": canonical,
+            }
+            # 先持久化再更新内存：存储失败时数据与幂等记录均不可见。
+            self._persist_telemetry_batch_locked(record)
+            self._telemetry_requests[key] = {
+                "points": canonical,
+                "accepted_count": len(points),
+            }
+            bucket = self._telemetry.setdefault(device_id, [])
+            for point in points:
+                self._telemetry_seq += 1
+                bucket.append(
+                    {
+                        "metric": point["metric"],
+                        "dt": point["dt"],
+                        "value": point["value"],
+                        "seq": self._telemetry_seq,
+                    }
+                )
+            return {"request_id": request_id, "accepted_count": len(points)}
+
+    def query_telemetry(self, device_id: str, params: dict) -> dict:
+        if not isinstance(params, dict):
+            raise ServiceError("query parameters must be a mapping")
+        unknown = set(params) - {"metric", "start", "end", "resolution"}
+        if unknown:
+            raise ServiceError(
+                f"unknown query parameter(s): {', '.join(sorted(unknown))}"
+            )
+        for field in ("metric", "start", "end", "resolution"):
+            if field not in params:
+                raise ServiceError(f"missing required query parameter: {field}")
+        metric = _validate_identifier(params["metric"], "metric")
+        start = _parse_rfc3339(params["start"], "start")
+        end = _parse_rfc3339(params["end"], "end")
+        resolution = params["resolution"]
+        if resolution not in TELEMETRY_RESOLUTIONS:
+            raise ServiceError("resolution must be one of: raw, 60, 300, 3600")
+        # 区间包含 start、不包含 end，且 start 必须早于 end。
+        if not start < end:
+            raise ServiceError("start must be earlier than end")
+        span = end - start
+        if resolution == "raw":
+            if span > TELEMETRY_RAW_MAX_SPAN:
+                raise ServiceError("raw queries are limited to 24 hours")
+        elif span > TELEMETRY_DOWNSAMPLED_MAX_SPAN:
+            raise ServiceError("downsampled queries are limited to 31 days")
+
+        with self._lock:
+            if device_id not in self._devices:
+                raise ServiceError(
+                    f"device {device_id!r} not found",
+                    code="device_not_found",
+                    status=404,
+                )
+            # 已吊销设备仍可查询；凭据轮换与会话离线不影响遥测数据。
+            points = [
+                point
+                for point in self._telemetry.get(device_id, [])
+                if point["metric"] == metric and start <= point["dt"] < end
+            ]
+            # 时间升序；同时间按受理顺序（seq）排列。
+            points.sort(key=lambda point: (point["dt"], point["seq"]))
+            if resolution == "raw":
+                return {
+                    "device_id": device_id,
+                    "metric": metric,
+                    "resolution": "raw",
+                    "points": [
+                        {
+                            "metric": point["metric"],
+                            "timestamp": _rfc3339_utc(point["dt"]),
+                            "value": point["value"],
+                        }
+                        for point in points
+                    ],
+                }
+            step = int(resolution)
+            buckets: dict[int, list[dict]] = {}
+            for point in points:
+                # 窗口按 Unix 纪元对齐：窗口起始 = floor(epoch / step) * step。
+                index = math.floor(point["dt"].timestamp() / step)
+                buckets.setdefault(index, []).append(point)
+            windows: list[dict] = []
+            for index in sorted(buckets):
+                members = buckets[index]
+                values = [member["value"] for member in members]
+                window_start = datetime.fromtimestamp(
+                    index * step, tz=timezone.utc
+                )
+                windows.append(
+                    {
+                        "start": _rfc3339_utc(window_start),
+                        "count": len(members),
+                        "min": min(values),
+                        "max": max(values),
+                        "avg": sum(values) / len(values),
+                        # last 取窗口内最后一点（时间升序、同时间按受理顺序）。
+                        "last": members[-1]["value"],
+                    }
+                )
+            return {
+                "device_id": device_id,
+                "metric": metric,
+                "resolution": resolution,
+                "windows": windows,
+            }

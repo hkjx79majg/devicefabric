@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlsplit
 
 from .service import Service, ServiceError
 
@@ -60,6 +61,22 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == "/v1/rules":
             self.handle_service_call(lambda: (200, self.service.list_rules()))
+            return
+        telemetry_target = self._extract_device_telemetry_path(self.path)
+        if telemetry_target is not None:
+            device_id, raw_query = telemetry_target
+
+            def action() -> tuple[int, dict]:
+                params: dict[str, str] = {}
+                for key, values in parse_qs(raw_query, keep_blank_values=True).items():
+                    if len(values) != 1:
+                        raise ServiceError(
+                            f"query parameter {key!r} must appear exactly once"
+                        )
+                    params[key] = values[0]
+                return 200, self.service.query_telemetry(device_id, params)
+
+            self.handle_service_call(action)
             return
         group_batch = self._extract_group_batch_ids(self.path)
         if group_batch is not None:
@@ -174,6 +191,12 @@ class Handler(BaseHTTPRequestHandler):
                 return 200, self.service.heartbeat_session(session_id, self.read_json_object())
             self.handle_service_call(action)
             return
+        session_id = self._extract_session_id(path, "/telemetry")
+        if session_id is not None:
+            def action() -> tuple[int, dict]:
+                return 202, self.service.submit_telemetry(session_id, self.read_json_object())
+            self.handle_service_call(action)
+            return
         session_id = self._extract_session_id(path, "/subscriptions")
         if session_id is not None:
             def action() -> tuple[int, dict]:
@@ -264,6 +287,26 @@ class Handler(BaseHTTPRequestHandler):
         segment = path[len(prefix):end]
         if segment and all(ch.isascii() and (ch.isalnum() or ch in "._-") for ch in segment):
             return segment
+        return None
+
+    @staticmethod
+    def _extract_device_telemetry_path(path: str) -> tuple[str, str] | None:
+        """匹配 /v1/devices/{device_id}/telemetry[?query]。
+
+        返回 (device_id, 原始查询字符串)；形状不匹配或标识段非法返回
+        None（沿用设备路由惯例，交由后续路由处理为 404）。
+        """
+        prefix = "/v1/devices/"
+        suffix = "/telemetry"
+        split = urlsplit(path)
+        pure_path = split.path
+        if not pure_path.startswith(prefix) or not pure_path.endswith(suffix):
+            return None
+        segment = pure_path[len(prefix):len(pure_path) - len(suffix)]
+        if segment and all(
+            ch.isascii() and (ch.isalnum() or ch in "._-") for ch in segment
+        ):
+            return segment, split.query
         return None
 
     @staticmethod
