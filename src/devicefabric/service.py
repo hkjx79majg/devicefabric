@@ -34,9 +34,21 @@ RULE_PATH_MIN = 1
 RULE_PATH_MAX = 16
 RULE_OPERATORS = frozenset({"eq", "ne", "gt", "gte", "lt", "lte"})
 
+COMMAND_TTL_MIN = 5
+COMMAND_TTL_MAX = 86400
+
 SESSION_ONLINE = "online"
 SESSION_CLOSED = "closed"
 SESSION_EXPIRED = "expired"
+
+COMMAND_QUEUED = "queued"
+COMMAND_DELIVERED = "delivered"
+COMMAND_SUCCEEDED = "succeeded"
+COMMAND_FAILED = "failed"
+COMMAND_EXPIRED = "expired"
+COMMAND_CANCELLED = "cancelled"
+# 非终态：仍可被领取或确认的状态。
+COMMAND_OPEN_STATES = frozenset({COMMAND_QUEUED, COMMAND_DELIVERED})
 
 
 class ServiceError(Exception):
@@ -166,6 +178,35 @@ def _validate_max_messages(value: object) -> int:
         raise ServiceError("max_messages must be an integer")
     if not POLL_MIN <= value <= POLL_MAX:
         raise ServiceError(f"max_messages must be between {POLL_MIN} and {POLL_MAX}")
+    return value
+
+
+def _validate_command_name(value: object) -> str:
+    # command_name 沿用 device_id 的标识规则。
+    if not isinstance(value, str) or isinstance(value, bool):
+        raise ServiceError("command_name must be a string")
+    if not DEVICE_ID_MIN <= len(value) <= DEVICE_ID_MAX or not DEVICE_ID_RE.match(value):
+        raise ServiceError(
+            "command_name must be 1-64 ASCII letters, digits, dots, underscores or hyphens"
+        )
+    return value
+
+
+def _validate_ttl_seconds(value: object) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ServiceError("ttl_seconds must be an integer")
+    if not COMMAND_TTL_MIN <= value <= COMMAND_TTL_MAX:
+        raise ServiceError(
+            f"ttl_seconds must be between {COMMAND_TTL_MIN} and {COMMAND_TTL_MAX}"
+        )
+    return value
+
+
+def _validate_max_commands(value: object) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ServiceError("max_commands must be an integer")
+    if not POLL_MIN <= value <= POLL_MAX:
+        raise ServiceError(f"max_commands must be between {POLL_MIN} and {POLL_MAX}")
     return value
 
 
@@ -304,6 +345,13 @@ class Service:
         # 吊销）后容器仍保留，直至同组合 clean_start=true 重连或设备吊销。
         # 进程重启即清空。
         self._persistent_sessions: dict[tuple[str, str], dict] = {}
+        # 进程内设备命令：command_id -> 命令记录；另按设备保存创建顺序，
+        # 保证领取按创建顺序进行。仅存在当前进程内，重启即清空；凭据轮换
+        # 不影响命令，设备吊销时非终态命令变为 cancelled。
+        self._commands: dict[str, dict] = {}
+        self._device_commands: dict[str, list[str]] = {}
+        # 记录本进程签发过的全部命令 ID，保证命令在进程内绝不重复。
+        self._issued_command_ids: set[str] = set()
 
     @staticmethod
     def _new_routes_locked() -> dict:
@@ -461,6 +509,11 @@ class Service:
             for key in list(self._persistent_sessions):
                 if key[0] == device_id:
                     del self._persistent_sessions[key]
+            # 吊销设备时，该设备全部非终态命令变为 cancelled。
+            for command_id in self._device_commands.get(device_id, []):
+                command = self._commands[command_id]
+                if command["status"] in COMMAND_OPEN_STATES:
+                    command["status"] = COMMAND_CANCELLED
             return self._public_device(device)
 
     # ------------------------------------------------------------------
@@ -1278,3 +1331,234 @@ class Service:
             del self._rules[rule_id]
             self._rule_order.remove(rule_id)
             return {"deleted": True}
+
+    # ------------------------------------------------------------------
+    # 设备命令：下发、领取与确认
+    # ------------------------------------------------------------------
+
+    def _mint_command_id_locked(self) -> str:
+        command_id = secrets.token_urlsafe(18)
+        while command_id in self._issued_command_ids:
+            command_id = secrets.token_urlsafe(18)
+        self._issued_command_ids.add(command_id)
+        return command_id
+
+    @staticmethod
+    def _public_command_locked(command: dict) -> dict:
+        """命令完整快照；深拷贝避免调用方修改进程内状态。"""
+        completed_at = command["completed_at"]
+        return {
+            "command_id": command["command_id"],
+            "device_id": command["device_id"],
+            "command_name": command["command_name"],
+            "payload": copy.deepcopy(command["payload"]),
+            "ttl_seconds": command["ttl_seconds"],
+            "status": command["status"],
+            "delivery_count": command["delivery_count"],
+            "created_at": _rfc3339_utc(command["created_at"]),
+            "expires_at": _rfc3339_utc(command["expires_at"]),
+            "completed_at": (
+                _rfc3339_utc(completed_at) if completed_at is not None else None
+            ),
+            "result": copy.deepcopy(command["result"]),
+        }
+
+    @staticmethod
+    def _expire_command_if_due_locked(command: dict, now: datetime) -> bool:
+        """到达 expires_at 的非终态命令转为 expired，不再可领取。"""
+        if command["status"] in COMMAND_OPEN_STATES and now > command["expires_at"]:
+            command["status"] = COMMAND_EXPIRED
+            return True
+        return False
+
+    def create_command(self, device_id: str, payload: object) -> dict:
+        data = self._require_fields(
+            payload, {"command_name", "payload", "ttl_seconds"}
+        )
+        command_name = _validate_command_name(data["command_name"])
+        # payload 可为任意 JSON 值（null、标量、数组或对象），原样保留。
+        command_payload = data["payload"]
+        ttl_seconds = _validate_ttl_seconds(data["ttl_seconds"])
+
+        with self._lock:
+            device = self._devices.get(device_id)
+            if device is None:
+                raise ServiceError(
+                    f"device {device_id!r} not found",
+                    code="device_not_found",
+                    status=404,
+                )
+            if not device["active"]:
+                raise ServiceError(
+                    f"device {device_id!r} is revoked",
+                    code="device_revoked",
+                    status=409,
+                )
+            now = _utc_now()
+            command = {
+                "command_id": self._mint_command_id_locked(),
+                "device_id": device_id,
+                "command_name": command_name,
+                # 深拷贝隔离调用方持有的请求对象。
+                "payload": copy.deepcopy(command_payload),
+                "ttl_seconds": ttl_seconds,
+                "status": COMMAND_QUEUED,
+                "delivery_count": 0,
+                # 当前持有领取的会话；无人领取时为 None。
+                "claimed_session_id": None,
+                "created_at": now,
+                "expires_at": now + timedelta(seconds=ttl_seconds),
+                "completed_at": None,
+                "result": None,
+            }
+            self._commands[command["command_id"]] = command
+            self._device_commands.setdefault(device_id, []).append(
+                command["command_id"]
+            )
+            return self._public_command_locked(command)
+
+    def get_command(self, device_id: str, command_id: str) -> dict:
+        with self._lock:
+            if device_id not in self._devices:
+                raise ServiceError(
+                    f"device {device_id!r} not found",
+                    code="device_not_found",
+                    status=404,
+                )
+            command = self._commands.get(command_id)
+            if command is None or command["device_id"] != device_id:
+                raise ServiceError(
+                    f"command {command_id!r} not found",
+                    code="command_not_found",
+                    status=404,
+                )
+            self._expire_command_if_due_locked(command, _utc_now())
+            return self._public_command_locked(command)
+
+    def poll_commands(self, session_id: str, payload: object) -> dict:
+        data = self._require_fields(payload, {"session_token", "max_commands"})
+        token = data["session_token"]
+        if not isinstance(token, str) or isinstance(token, bool):
+            raise ServiceError("session_token must be a string")
+        max_commands = _validate_max_commands(data["max_commands"])
+
+        with self._lock:
+            now = _utc_now()
+            # 沿用会话鉴权及保活规则：未知 404、令牌错误 401、已离线 409。
+            session = self._authenticate_online_session_locked(
+                session_id, token, now
+            )
+            claimed: list[dict] = []
+            for command_id in self._device_commands.get(session["device_id"], []):
+                if len(claimed) >= max_commands:
+                    break
+                command = self._commands[command_id]
+                self._expire_command_if_due_locked(command, now)
+                status = command["status"]
+                dup = False
+                if status == COMMAND_QUEUED:
+                    # 首次领取：状态改为 delivered、计数加一、dup 为 false。
+                    command["status"] = COMMAND_DELIVERED
+                    command["delivery_count"] += 1
+                    command["claimed_session_id"] = session["session_id"]
+                elif status == COMMAND_DELIVERED:
+                    if command["claimed_session_id"] == session["session_id"]:
+                        # 确认前由同一会话重领：归属与计数不变，dup 为 true。
+                        dup = True
+                    else:
+                        holder = self._sessions.get(command["claimed_session_id"])
+                        if holder is not None:
+                            self._expire_if_timed_out_locked(holder, now)
+                        if holder is not None and holder["state"] == SESSION_ONLINE:
+                            # 并发领取不得双重归属：仍被其他在线会话持有时跳过。
+                            continue
+                        # 领取会话已超时或被替换：转移归属，计数再加一，
+                        # dup 为 true。
+                        command["delivery_count"] += 1
+                        command["claimed_session_id"] = session["session_id"]
+                        dup = True
+                else:
+                    # 终态命令（succeeded/failed/expired/cancelled）不再领取。
+                    continue
+                claimed.append(
+                    {
+                        "command_id": command["command_id"],
+                        "command_name": command["command_name"],
+                        "payload": copy.deepcopy(command["payload"]),
+                        "delivery_count": command["delivery_count"],
+                        "dup": dup,
+                        "created_at": _rfc3339_utc(command["created_at"]),
+                        "expires_at": _rfc3339_utc(command["expires_at"]),
+                    }
+                )
+            return {"commands": claimed}
+
+    def ack_command(
+        self, session_id: str, command_id: str, payload: object
+    ) -> dict:
+        data = self._require_fields(payload, {"session_token", "status", "result"})
+        token = data["session_token"]
+        if not isinstance(token, str) or isinstance(token, bool):
+            raise ServiceError("session_token must be a string")
+        status = data["status"]
+        if not isinstance(status, str) or isinstance(status, bool):
+            raise ServiceError("status must be a string")
+        if status not in (COMMAND_SUCCEEDED, COMMAND_FAILED):
+            raise ServiceError("status must be 'succeeded' or 'failed'")
+        # result 可为任意 JSON 值，原样保留。
+        result = data["result"]
+
+        with self._lock:
+            now = _utc_now()
+            # 沿用会话鉴权及保活规则：未知 404、令牌错误 401、已离线 409。
+            session = self._authenticate_online_session_locked(
+                session_id, token, now
+            )
+            command = self._commands.get(command_id)
+            if command is None or command["device_id"] != session["device_id"]:
+                # 非目标设备的命令按不存在处理。
+                raise ServiceError(
+                    f"command {command_id!r} not found",
+                    code="command_not_found",
+                    status=404,
+                )
+            self._expire_command_if_due_locked(command, now)
+            current = command["status"]
+            if current == COMMAND_EXPIRED:
+                raise ServiceError(
+                    f"command {command_id!r} has expired",
+                    code="command_expired",
+                    status=409,
+                )
+            if current in (COMMAND_SUCCEEDED, COMMAND_FAILED):
+                # 终态命令：相同确认幂等返回，内容冲突报 409。
+                if current == status and _json_equal(command["result"], result):
+                    return self._public_command_locked(command)
+                raise ServiceError(
+                    f"command {command_id!r} is already completed",
+                    code="command_already_completed",
+                    status=409,
+                )
+            if current == COMMAND_CANCELLED:
+                raise ServiceError(
+                    f"command {command_id!r} is already completed",
+                    code="command_already_completed",
+                    status=409,
+                )
+            if current == COMMAND_QUEUED:
+                raise ServiceError(
+                    f"command {command_id!r} has not been delivered",
+                    code="command_not_delivered",
+                    status=409,
+                )
+            # delivered：首次确认只接受当前领取会话。
+            if command["claimed_session_id"] != session["session_id"]:
+                raise ServiceError(
+                    f"command {command_id!r} has not been delivered to this session",
+                    code="command_not_delivered",
+                    status=409,
+                )
+            command["status"] = status
+            command["result"] = copy.deepcopy(result)
+            command["completed_at"] = now
+            return self._public_command_locked(command)

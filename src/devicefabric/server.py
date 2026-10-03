@@ -57,6 +57,13 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/v1/rules":
             self.handle_service_call(lambda: (200, self.service.list_rules()))
             return
+        command_route = self._extract_device_command_route(self.path)
+        if command_route is not None:
+            device_id, command_id = command_route
+            self.handle_service_call(
+                lambda: (200, self.service.get_command(device_id, command_id))
+            )
+            return
         device_id = self._extract_device_id(self.path, "/shadow")
         if device_id is not None:
             self.handle_service_call(lambda: (200, self.service.get_shadow(device_id)))
@@ -110,6 +117,29 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/v1/device-sessions":
             def action() -> tuple[int, dict]:
                 return 201, self.service.create_session(self.read_json_object())
+            self.handle_service_call(action)
+            return
+        device_id = self._extract_device_id(path, "/commands")
+        if device_id is not None:
+            def action() -> tuple[int, dict]:
+                return 202, self.service.create_command(
+                    device_id, self.read_json_object()
+                )
+            self.handle_service_call(action)
+            return
+        session_command = self._extract_session_command_route(path)
+        if session_command is not None:
+            session_id, command_id = session_command
+            if command_id is None:
+                def action() -> tuple[int, dict]:
+                    return 200, self.service.poll_commands(
+                        session_id, self.read_json_object()
+                    )
+            else:
+                def action() -> tuple[int, dict]:
+                    return 200, self.service.ack_command(
+                        session_id, command_id, self.read_json_object()
+                    )
             self.handle_service_call(action)
             return
         session_id = self._extract_session_id(path, "/heartbeat")
@@ -201,6 +231,50 @@ class Handler(BaseHTTPRequestHandler):
         segment = path[len(prefix):end]
         if segment and all(ch.isascii() and (ch.isalnum() or ch in "._-") for ch in segment):
             return segment
+        return None
+
+    @staticmethod
+    def _valid_segment(segment: str) -> bool:
+        return bool(segment) and all(
+            ch.isascii() and (ch.isalnum() or ch in "._-") for ch in segment
+        )
+
+    @staticmethod
+    def _extract_device_command_route(path: str) -> tuple[str, str] | None:
+        """匹配 ``/v1/devices/{device_id}/commands/{command_id}``。"""
+        prefix = "/v1/devices/"
+        if not path.startswith(prefix):
+            return None
+        rest = path[len(prefix):]
+        device_id, sep, command_id = rest.partition("/commands/")
+        if not sep:
+            return None
+        if Handler._valid_segment(device_id) and Handler._valid_segment(command_id):
+            return device_id, command_id
+        return None
+
+    @staticmethod
+    def _extract_session_command_route(path: str) -> tuple[str, str | None] | None:
+        """匹配会话命令路径。
+
+        ``/v1/device-sessions/{session_id}/commands/poll`` 返回
+        ``(session_id, None)``；
+        ``/v1/device-sessions/{session_id}/commands/{command_id}/ack`` 返回
+        ``(session_id, command_id)``。
+        """
+        prefix = "/v1/device-sessions/"
+        if not path.startswith(prefix):
+            return None
+        rest = path[len(prefix):]
+        session_id, sep, tail = rest.partition("/commands")
+        if not sep or not Handler._valid_segment(session_id):
+            return None
+        if tail == "/poll":
+            return session_id, None
+        if tail.startswith("/") and tail.endswith("/ack"):
+            command_id = tail[1:-len("/ack")]
+            if Handler._valid_segment(command_id):
+                return session_id, command_id
         return None
 
     def log_message(self, fmt: str, *args: object) -> None:
