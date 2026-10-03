@@ -56,10 +56,25 @@ PYTHONPATH=src python3 -m devicefabric.server --host 127.0.0.1 --port 8080
 - 乐观并发：提供 `expected_version` 时，其值必须为非负整数且等于写入前的 `version`，否则返回 `409`（`shadow_version_conflict`）且影子不变；不提供时不做版本检查。并发的相同预期版本写入至多一个成功。
 - 非 JSON 对象、缺少必填字段（desired 为 `state`，reported 为 `session_token`、`state`）、含未知字段、`state` 不是 JSON 对象或 `expected_version` 非法（非非负整数，含布尔值）均返回 `400`（`invalid_request`），影子不变。
 
+## 进程内规则引擎
+
+规则仅保存在当前进程内，服务重启即清空；设备吊销或会话离线不删除规则。
+
+- `POST /v1/rules`：请求体为 `{"rule_id", "topic_filter", "enabled", "condition", "action"}`。`rule_id` 沿用设备标识规则（1-64 个 ASCII 字母、数字、点、下划线或短横线）且在规则中唯一；`topic_filter` 沿用订阅过滤器语义；`enabled` 为 JSON 布尔值。`condition` 为 `{"path", "operator", "value"}`：`path` 为一至十六个非空字符串，`operator` 为 `eq`、`ne`、`gt`、`gte`、`lt`、`lte` 之一；大小比较（`gt`/`gte`/`lt`/`lte`）的 `value` 必须是非布尔数字，`eq`/`ne` 的 `value` 可为任意 JSON 值。`action` 为 `{"topic", "payload", "qos"}`：`topic` 为合法固定 topic（不含通配符），`payload` 为任意 JSON 值，`qos` 为整数 `0` 或 `1`。成功返回 `201` 与完整规则对象；重复 `rule_id` 返回 `409`（`rule_already_exists`），原规则不变。
+- `GET /v1/rules`：返回 `200 {"rules": [...]}`，按创建顺序列出完整规则；无规则时为空数组。
+- `PUT /v1/rules/{rule_id}/enabled`：请求体只接受 `{"enabled": true}` 或 `{"enabled": false}`，返回 `200` 与完整规则；目标不存在返回 `404`（`rule_not_found`）。
+- `DELETE /v1/rules/{rule_id}`：删除规则并返回 `200 {"deleted": true}`；目标不存在返回 `404`（`rule_not_found`）。
+
+在线会话发布通过全部校验与鉴权、且原消息完成入队后，系统按创建顺序评估当时已启用的规则。规则过滤器与条件均命中时，以 action 的 `topic`、`payload`、`qos`、原发布设备身份（`publisher_device_id`）和新生成的唯一 `message_id` 构造一条普通非保留实时消息，按现有订阅匹配、QoS（含独立 `delivery_id`、重投、背压与确认）语义投递给当时在线的会话。每条命中各生成一条消息；动作消息不再触发规则（无级联）；原消息保证先于动作消息入队。发布响应的 `message_id` 与 `matched_count` 口径不变，动作投递不计入 `matched_count`。
+
+条件按 `path` 逐层在消息 `payload` 中读取：任一层缺失或中途遇到非 JSON 对象即不命中；`eq`、`ne` 按 JSON 值深度比较；大小比较仅当读取到的值也是非布尔数字时才判断，否则不命中。保留消息的订阅回放不触发规则；带 `retain` 的实时发布照常评估规则，但其动作消息不写入保留存储。未通过发布校验、会话鉴权或保活超时的请求不评估任何规则。
+
+规则四个入口对非 JSON 对象、字段缺失或多余、`rule_id`/过滤器/topic 非法、`enabled` 非布尔、`condition` 或 `action` 任一非法均返回 `400`（`invalid_request`），且不改变规则集合或任何消息队列。
+
 ## 验证
 
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-当前测试覆盖健康检查基线与设备注册、凭据认证、轮换、吊销、连接会话、心跳保活、MQTT 风格主题订阅、发布（QoS 0 与 QoS 1）、拉取、重投与确认，以及设备影子的期望/实际状态写入、差异计算、版本冲突与会话鉴权的成功与失败语义。规则引擎仍留待后续任务从已冻结事实出发独立设计并验证。
+当前测试覆盖健康检查基线与设备注册、凭据认证、轮换、吊销、连接会话、心跳保活、MQTT 风格主题订阅、发布（QoS 0 与 QoS 1）、拉取、重投与确认、设备影子的期望/实际状态写入、差异计算、版本冲突与会话鉴权，以及进程内规则引擎的创建、列表、启停、删除、字段校验、命中评估顺序、条件语义、动作投递（QoS 与背压）、无级联与保留回放不触发规则等成功与失败语义。

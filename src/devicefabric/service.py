@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import copy
 import hmac
+import math
 import re
 import secrets
 import threading
@@ -29,6 +30,11 @@ TOPIC_MIN = 1
 TOPIC_MAX = 256
 POLL_MIN = 1
 POLL_MAX = 100
+
+RULE_PATH_MIN = 1
+RULE_PATH_MAX = 16
+RULE_OPERATORS = {"eq", "ne", "gt", "gte", "lt", "lte"}
+RULE_ORDERING_OPERATORS = {"gt", "gte", "lt", "lte"}
 
 SESSION_ONLINE = "online"
 SESSION_CLOSED = "closed"
@@ -194,6 +200,10 @@ class Service:
         # "updated_at"}。注册时初始化，仅存在当前进程内；吊销、凭据轮换
         # 或会话离线都不删除。
         self._shadows: dict[str, dict] = {}
+        # 进程内规则引擎：rule_id -> 规则记录，另以列表保存创建顺序。
+        # 规则仅存在当前进程内，重启即清空；设备吊销或会话离线不删除。
+        self._rules: dict[str, dict] = {}
+        self._rule_order: list[str] = []
 
     def health(self) -> dict[str, str]:
         return {"status": "ok", "service": self.name, "version": self.version}
@@ -660,25 +670,9 @@ class Service:
                 "publisher_device_id": publisher["device_id"],
                 "published_at": _rfc3339_utc(now),
             }
-            matched = 0
-            for target in self._sessions.values():
-                # 路由前按既有保活规则处理超时，只投递给在线会话。
-                self._expire_if_timed_out_locked(target, now)
-                if target["state"] != SESSION_ONLINE:
-                    continue
-                if not any(
-                    _topic_matches_filter(topic_layers, _split_topic_layers(sub))
-                    for sub in target["subscriptions"]
-                ):
-                    continue
-                # 同一会话即使被多个过滤器命中也只入队一份。
-                # 实时投递不携带 retained 标记。
-                entry = {"qos": qos, "message": message, "delivery_id": None}
-                if qos == 1:
-                    # 每个命中的在线会话获得独立且不可预测的 delivery_id。
-                    entry["delivery_id"] = self._mint_delivery_id_locked()
-                target["queue"].append(entry)
-                matched += 1
+            matched = self._route_live_message_locked(
+                message, topic_layers, qos, now
+            )
             if retain:
                 if message_payload is None:
                     # 保留清除：消息仍实时投递，同时删除该 topic 的保留值，
@@ -693,7 +687,44 @@ class Service:
                         "qos": qos,
                         "seq": self._retained_sequence,
                     }
+            # 发布校验、鉴权与原消息入队完成后，按创建顺序评估已启用规则。
+            # 命中规则以原发布设备身份各生成一条新的普通非保留消息；动作
+            # 消息不再触发规则，且动作投递不计入 matched_count。
+            self._evaluate_rules_locked(message, topic_layers, message_payload, now)
             return {"message_id": message["message_id"], "matched_count": matched}
+
+    def _route_live_message_locked(
+        self,
+        message: dict,
+        topic_layers: list[str],
+        qos: int,
+        now: datetime,
+    ) -> int:
+        """把一条普通（非保留回放）消息按订阅投递给当时在线的会话。
+
+        同一会话即使被多个过滤器命中也只入队一份；返回实际入队的在线
+        会话数。实时投递不携带 retained 标记。
+        """
+        matched = 0
+        for target in self._sessions.values():
+            # 路由前按既有保活规则处理超时，只投递给在线会话。
+            self._expire_if_timed_out_locked(target, now)
+            if target["state"] != SESSION_ONLINE:
+                continue
+            if not any(
+                _topic_matches_filter(topic_layers, _split_topic_layers(sub))
+                for sub in target["subscriptions"]
+            ):
+                continue
+            # 同一会话即使被多个过滤器命中也只入队一份。
+            # 实时投递不携带 retained 标记。
+            entry = {"qos": qos, "message": message, "delivery_id": None}
+            if qos == 1:
+                # 每个命中的在线会话获得独立且不可预测的 delivery_id。
+                entry["delivery_id"] = self._mint_delivery_id_locked()
+            target["queue"].append(entry)
+            matched += 1
+        return matched
 
     @staticmethod
     def _render_delivery(entry: dict, dup: bool) -> dict:
@@ -917,3 +948,250 @@ class Service:
             shadow["version"] += 1
             shadow["updated_at"] = _rfc3339_utc(now)
             return self._shadow_snapshot_locked(device_id, shadow)
+
+    # ------------------------------------------------------------------
+    # 进程内规则引擎
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _public_rule_locked(rule: dict) -> dict:
+        """规则完整视图；深拷贝避免调用方修改进程内状态。"""
+        return {
+            "rule_id": rule["rule_id"],
+            "topic_filter": rule["topic_filter"],
+            "enabled": rule["enabled"],
+            "condition": copy.deepcopy(rule["condition"]),
+            "action": copy.deepcopy(rule["action"]),
+        }
+
+    @staticmethod
+    def _validate_rule_path(value: object) -> list[str]:
+        if not isinstance(value, list):
+            raise ServiceError("condition.path must be an array")
+        if not RULE_PATH_MIN <= len(value) <= RULE_PATH_MAX:
+            raise ServiceError("condition.path must contain 1-16 non-empty strings")
+        for segment in value:
+            if not isinstance(segment, str) or isinstance(segment, bool) or segment == "":
+                raise ServiceError("condition.path must contain 1-16 non-empty strings")
+        return value
+
+    @staticmethod
+    def _is_non_boolean_number(value: object) -> bool:
+        # bool 是 int 的子类，大小比较须显式排除布尔。
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+    def _validate_condition(self, value: object) -> dict:
+        if not isinstance(value, dict):
+            raise ServiceError("condition must be a JSON object")
+        unknown = set(value) - {"path", "operator", "value"}
+        if unknown:
+            raise ServiceError(f"unknown field(s): {', '.join(sorted(unknown))}")
+        for field in ("path", "operator", "value"):
+            if field not in value:
+                raise ServiceError(f"missing required field: condition.{field}")
+        path = self._validate_rule_path(value["path"])
+        operator = value["operator"]
+        if not isinstance(operator, str) or operator not in RULE_OPERATORS:
+            raise ServiceError(
+                "condition.operator must be one of: eq, ne, gt, gte, lt, lte"
+            )
+        condition_value = value["value"]
+        if operator in RULE_ORDERING_OPERATORS:
+            if not self._is_non_boolean_number(condition_value):
+                raise ServiceError(
+                    "condition.value must be a non-boolean number for ordering operators"
+                )
+        return {"path": path, "operator": operator, "value": condition_value}
+
+    def _validate_action(self, value: object) -> dict:
+        if not isinstance(value, dict):
+            raise ServiceError("action must be a JSON object")
+        unknown = set(value) - {"topic", "payload", "qos"}
+        if unknown:
+            raise ServiceError(f"unknown field(s): {', '.join(sorted(unknown))}")
+        for field in ("topic", "payload", "qos"):
+            if field not in value:
+                raise ServiceError(f"missing required field: action.{field}")
+        # action topic 为合法固定 topic：沿用普通 topic 校验（不含通配符）。
+        topic = _validate_topic(value["topic"])
+        # payload 可为任意 JSON 值（null、标量、数组或对象），原样保留。
+        payload = value["payload"]
+        qos = value["qos"]
+        if not isinstance(qos, int) or isinstance(qos, bool) or qos not in (0, 1):
+            raise ServiceError("action.qos must be the integer 0 or 1")
+        return {"topic": topic, "payload": payload, "qos": qos}
+
+    def create_rule(self, payload: object) -> dict:
+        data = self._require_fields(
+            payload, {"rule_id", "topic_filter", "enabled", "condition", "action"}
+        )
+        # rule_id 沿用设备标识规则且唯一。
+        rule_id = _validate_device_id(data["rule_id"])
+        topic_filter = _validate_topic_filter(data["topic_filter"])
+        enabled = data["enabled"]
+        if not isinstance(enabled, bool):
+            raise ServiceError("enabled must be a boolean")
+        condition = self._validate_condition(data["condition"])
+        action = self._validate_action(data["action"])
+
+        with self._lock:
+            if rule_id in self._rules:
+                raise ServiceError(
+                    f"rule {rule_id!r} already exists",
+                    code="rule_already_exists",
+                    status=409,
+                )
+            rule = {
+                "rule_id": rule_id,
+                "topic_filter": topic_filter,
+                "enabled": enabled,
+                # 深拷贝隔离请求入参，调用方后续修改不影响进程内状态。
+                "condition": copy.deepcopy(condition),
+                "action": copy.deepcopy(action),
+            }
+            self._rules[rule_id] = rule
+            # 列表末尾记录创建顺序。
+            self._rule_order.append(rule_id)
+            return self._public_rule_locked(rule)
+
+    def list_rules(self) -> dict:
+        with self._lock:
+            return {
+                "rules": [
+                    self._public_rule_locked(self._rules[rule_id])
+                    for rule_id in self._rule_order
+                ]
+            }
+
+    def _get_rule_locked(self, rule_id: str) -> dict:
+        rule = self._rules.get(rule_id)
+        if rule is None:
+            raise ServiceError(
+                f"rule {rule_id!r} not found",
+                code="rule_not_found",
+                status=404,
+            )
+        return rule
+
+    def set_rule_enabled(self, rule_id: str, payload: object) -> dict:
+        if not isinstance(payload, dict):
+            raise ServiceError("request body must be a JSON object")
+        unknown = set(payload) - {"enabled"}
+        if unknown:
+            raise ServiceError(f"unknown field(s): {', '.join(sorted(unknown))}")
+        if "enabled" not in payload:
+            raise ServiceError("missing required field: enabled")
+        enabled = payload["enabled"]
+        # 只接受 JSON 布尔值；True/False 之外（含 1/0、"true"）一律非法。
+        if not isinstance(enabled, bool):
+            raise ServiceError("enabled must be a boolean")
+
+        with self._lock:
+            rule = self._get_rule_locked(rule_id)
+            rule["enabled"] = enabled
+            return self._public_rule_locked(rule)
+
+    def delete_rule(self, rule_id: str) -> dict:
+        with self._lock:
+            self._get_rule_locked(rule_id)
+            del self._rules[rule_id]
+            self._rule_order.remove(rule_id)
+            return {"deleted": True}
+
+    @staticmethod
+    def _rule_condition_matches_locked(condition: dict, payload: object) -> bool:
+        """按 path 逐层读取 payload；缺失或中途遇到非对象即不命中。
+
+        eq、ne 按 JSON 值深度比较；大小比较仅当读取值也是非布尔数字时
+        才判断，否则不命中。
+        """
+        current = payload
+        for segment in condition["path"]:
+            if not isinstance(current, dict):
+                return False
+            if segment not in current:
+                return False
+            current = current[segment]
+        operator = condition["operator"]
+        expected = condition["value"]
+        if operator == "eq":
+            return _json_equal(current, expected)
+        if operator == "ne":
+            return not _json_equal(current, expected)
+        # 大小比较：读取值与比较值都必须是非布尔数字。
+        if not Service._is_non_boolean_number(current):
+            return False
+        if operator == "gt":
+            return current > expected
+        if operator == "gte":
+            return current >= expected
+        if operator == "lt":
+            return current < expected
+        if operator == "lte":
+            return current <= expected
+        return False
+
+    def _evaluate_rules_locked(
+        self,
+        message: dict,
+        topic_layers: list[str],
+        payload: object,
+        now: datetime,
+    ) -> None:
+        """原消息入队后按创建顺序评估已启用规则。
+
+        过滤器与条件均命中时，以 action 的 topic/payload/qos、原发布设备
+        身份与新 message_id 生成普通非保留消息，按现有订阅与 QoS 语义投递。
+        每条动作消息独立评估并投递；动作消息不再触发规则。
+        """
+        if not self._rule_order:
+            return
+        # 评估期间规则集合固定：按当前创建顺序取快照，动作消息不会重入。
+        for rule_id in tuple(self._rule_order):
+            rule = self._rules.get(rule_id)
+            if rule is None or not rule["enabled"]:
+                continue
+            if not _topic_matches_filter(
+                topic_layers, _split_topic_layers(rule["topic_filter"])
+            ):
+                continue
+            if not self._rule_condition_matches_locked(rule["condition"], payload):
+                continue
+            action = rule["action"]
+            action_message = {
+                "message_id": self._mint_message_id_locked(),
+                "topic": action["topic"],
+                "payload": copy.deepcopy(action["payload"]),
+                "publisher_device_id": message["publisher_device_id"],
+                "published_at": _rfc3339_utc(now),
+            }
+            self._route_live_message_locked(
+                action_message,
+                _split_topic_layers(action["topic"]),
+                action["qos"],
+                now,
+            )
+
+
+def _json_equal(left: object, right: object) -> bool:
+    """按 JSON 值深度比较；dict/list 递归。
+
+    JSON 中布尔与数字是不同类型，故 True 不等于 1、False 不等于 0；
+    数字内部 int 与 float 按数值比较（1 等于 1.0）。NaN 不等于任何值。
+    """
+    if isinstance(left, bool) or isinstance(right, bool):
+        return isinstance(left, bool) and isinstance(right, bool) and left == right
+    if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+        if math.isnan(float(left)) or math.isnan(float(right)):
+            return False
+        return left == right
+    if isinstance(left, dict) and isinstance(right, dict):
+        if set(left) != set(right):
+            return False
+        return all(_json_equal(left[key], right[key]) for key in left)
+    if isinstance(left, list) and isinstance(right, list):
+        return len(left) == len(right) and all(
+            _json_equal(a, b) for a, b in zip(left, right)
+        )
+    # null、字符串等其余类型要求类型一致且值相等。
+    return type(left) is type(right) and left == right

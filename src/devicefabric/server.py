@@ -54,6 +54,9 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/healthz":
             self.send_json(200, self.service.health())
             return
+        if self.path == "/v1/rules":
+            self.handle_service_call(lambda: (200, self.service.list_rules()))
+            return
         device_id = self._extract_device_id(self.path, "/shadow")
         if device_id is not None:
             self.handle_service_call(lambda: (200, self.service.get_shadow(device_id)))
@@ -69,6 +72,14 @@ class Handler(BaseHTTPRequestHandler):
         self.send_not_found()
 
     def do_PUT(self) -> None:
+        rule_id = self._extract_rule_id(self.path, "/enabled")
+        if rule_id is not None:
+            def action() -> tuple[int, dict]:
+                return 200, self.service.set_rule_enabled(
+                    rule_id, self.read_json_object()
+                )
+            self.handle_service_call(action)
+            return
         device_id = self._extract_device_id(self.path, "/shadow/desired")
         if device_id is not None:
             def action() -> tuple[int, dict]:
@@ -84,6 +95,11 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/v1/devices":
             def action() -> tuple[int, dict]:
                 return 201, self.service.register_device(self.read_json_object())
+            self.handle_service_call(action)
+            return
+        if path == "/v1/rules":
+            def action() -> tuple[int, dict]:
+                return 201, self.service.create_rule(self.read_json_object())
             self.handle_service_call(action)
             return
         if path == "/v1/device-auth":
@@ -142,6 +158,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.send_not_found()
 
+    def do_DELETE(self) -> None:
+        rule_id = self._extract_rule_id(self.path)
+        if rule_id is not None:
+            self.handle_service_call(lambda: (200, self.service.delete_rule(rule_id)))
+            return
+        self.send_not_found()
+
     def send_not_found(self) -> None:
         self.send_error_json(404, "not_found", f"no route for {self.path}")
 
@@ -159,6 +182,17 @@ class Handler(BaseHTTPRequestHandler):
     @staticmethod
     def _extract_session_id(path: str, suffix: str = "") -> str | None:
         prefix = "/v1/device-sessions/"
+        if not path.startswith(prefix) or not path.endswith(suffix):
+            return None
+        end = len(path) - len(suffix) if suffix else len(path)
+        segment = path[len(prefix):end]
+        if segment and all(ch.isascii() and (ch.isalnum() or ch in "._-") for ch in segment):
+            return segment
+        return None
+
+    @staticmethod
+    def _extract_rule_id(path: str, suffix: str = "") -> str | None:
+        prefix = "/v1/rules/"
         if not path.startswith(prefix) or not path.endswith(suffix):
             return None
         end = len(path) - len(suffix) if suffix else len(path)
