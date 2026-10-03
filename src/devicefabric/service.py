@@ -176,6 +176,40 @@ def _validate_max_messages(value: object) -> int:
     return value
 
 
+def _validate_group_id(value: object) -> str:
+    # group_id 沿用 device_id 的标识规则。
+    if not isinstance(value, str) or isinstance(value, bool):
+        raise ServiceError("group_id must be a string")
+    if not DEVICE_ID_MIN <= len(value) <= DEVICE_ID_MAX or not DEVICE_ID_RE.match(value):
+        raise ServiceError(
+            "group_id must be 1-64 ASCII letters, digits, dots, underscores or hyphens"
+        )
+    return value
+
+
+def _validate_device_ids(value: object) -> list[str]:
+    # device_ids 为无重复的已注册设备标识数组；注册检查在锁内完成。
+    if not isinstance(value, list):
+        raise ServiceError("device_ids must be an array")
+    device_ids: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        device_id = _validate_device_id(item)
+        if device_id in seen:
+            raise ServiceError("device_ids must not contain duplicates")
+        seen.add(device_id)
+        device_ids.append(device_id)
+    return device_ids
+
+
+def _validate_request_id(value: object) -> str:
+    if not isinstance(value, str) or isinstance(value, bool):
+        raise ServiceError("request_id must be a string")
+    if not 1 <= len(value) <= 64:
+        raise ServiceError("request_id must be 1-64 characters")
+    return value
+
+
 def _validate_command_name(value: object) -> str:
     # command_name 沿用 device_id 的标识规则。
     if not isinstance(value, str) or isinstance(value, bool):
@@ -347,6 +381,17 @@ class Service:
         self._device_command_ids: dict[str, list[str]] = {}
         # 记录本进程签发过的全部命令 ID，保证命令在进程内绝不重复。
         self._issued_command_ids: set[str] = set()
+        # 进程内设备组：group_id -> 组记录（device_ids 为有序、无重复的
+        # 已注册设备标识，version 自 1 起单调递增）。仅存在当前进程内，
+        # 重启即清空；吊销设备不移除成员。
+        self._groups: dict[str, dict] = {}
+        # 进程内命令批次：batch_id -> 批次记录；另按组保存 request_id ->
+        # batch_id 索引，保证同组同 request_id 幂等。批次成员为受理时的
+        # 组快照，之后的成员替换不影响已创建批次。
+        self._batches: dict[str, dict] = {}
+        self._group_request_ids: dict[str, dict[str, str]] = {}
+        # 记录本进程签发过的全部批次 ID，保证批次在进程内绝不重复。
+        self._issued_batch_ids: set[str] = set()
 
     @staticmethod
     def _new_routes_locked() -> dict:
@@ -1368,6 +1413,36 @@ class Service:
         if command["status"] in COMMAND_NON_TERMINAL and now > command["expires_at"]:
             command["status"] = "expired"
 
+    def _create_command_locked(
+        self,
+        device_id: str,
+        command_name: str,
+        command_payload: object,
+        ttl_seconds: int,
+        now: datetime,
+    ) -> dict:
+        """在锁内创建一条 queued 命令记录（调用方负责设备存在与状态检查）。"""
+        command = {
+            "command_id": self._mint_command_id_locked(),
+            "device_id": device_id,
+            "command_name": command_name,
+            "payload": copy.deepcopy(command_payload),
+            "ttl_seconds": ttl_seconds,
+            "status": COMMAND_QUEUED,
+            "delivery_count": 0,
+            "created_at": now,
+            "expires_at": now + timedelta(seconds=ttl_seconds),
+            "completed_at": None,
+            "result": None,
+            # 当前领取该命令的会话；仅 queued/delivered 状态下有意义。
+            "owner_session_id": None,
+        }
+        self._commands[command["command_id"]] = command
+        self._device_command_ids.setdefault(device_id, []).append(
+            command["command_id"]
+        )
+        return command
+
     def create_command(self, device_id: str, payload: object) -> dict:
         data = self._require_fields(
             payload, {"command_name", "payload", "ttl_seconds"}
@@ -1391,25 +1466,8 @@ class Service:
                     code="device_revoked",
                     status=409,
                 )
-            now = _utc_now()
-            command = {
-                "command_id": self._mint_command_id_locked(),
-                "device_id": device_id,
-                "command_name": command_name,
-                "payload": copy.deepcopy(command_payload),
-                "ttl_seconds": ttl_seconds,
-                "status": COMMAND_QUEUED,
-                "delivery_count": 0,
-                "created_at": now,
-                "expires_at": now + timedelta(seconds=ttl_seconds),
-                "completed_at": None,
-                "result": None,
-                # 当前领取该命令的会话；仅 queued/delivered 状态下有意义。
-                "owner_session_id": None,
-            }
-            self._commands[command["command_id"]] = command
-            self._device_command_ids.setdefault(device_id, []).append(
-                command["command_id"]
+            command = self._create_command_locked(
+                device_id, command_name, command_payload, ttl_seconds, _utc_now()
             )
             return self._public_command_locked(command)
 
@@ -1550,3 +1608,257 @@ class Service:
             command["result"] = copy.deepcopy(result)
             command["completed_at"] = now
             return self._public_command_locked(command)
+
+    # ------------------------------------------------------------------
+    # 设备组：创建、查询与整体替换成员
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _public_group(group: dict) -> dict:
+        """组完整视图；成员列表拷贝避免调用方修改进程内状态。"""
+        return {
+            "group_id": group["group_id"],
+            "device_ids": list(group["device_ids"]),
+            "version": group["version"],
+        }
+
+    def create_group(self, payload: object) -> dict:
+        data = self._require_fields(payload, {"group_id", "device_ids"})
+        group_id = _validate_group_id(data["group_id"])
+        device_ids = _validate_device_ids(data["device_ids"])
+
+        with self._lock:
+            if group_id in self._groups:
+                raise ServiceError(
+                    f"device group {group_id!r} already exists",
+                    code="group_already_exists",
+                    status=409,
+                )
+            for device_id in device_ids:
+                if device_id not in self._devices:
+                    raise ServiceError(
+                        f"device {device_id!r} not found",
+                        code="device_not_found",
+                        status=404,
+                    )
+            group = {
+                "group_id": group_id,
+                "device_ids": device_ids,
+                "version": 1,
+            }
+            self._groups[group_id] = group
+            return self._public_group(group)
+
+    def get_group(self, group_id: str) -> dict:
+        with self._lock:
+            group = self._groups.get(group_id)
+            if group is None:
+                raise ServiceError(
+                    f"device group {group_id!r} not found",
+                    code="group_not_found",
+                    status=404,
+                )
+            return self._public_group(group)
+
+    def replace_group_members(self, group_id: str, payload: object) -> dict:
+        data = self._require_fields(
+            payload, {"device_ids"}, optional={"expected_version"}
+        )
+        device_ids = _validate_device_ids(data["device_ids"])
+        expected_version = None
+        if "expected_version" in data:
+            expected_version = self._validate_expected_version(
+                data["expected_version"]
+            )
+
+        with self._lock:
+            group = self._groups.get(group_id)
+            if group is None:
+                raise ServiceError(
+                    f"device group {group_id!r} not found",
+                    code="group_not_found",
+                    status=404,
+                )
+            # 任一设备未注册即整体失败，组保持不变。
+            for device_id in device_ids:
+                if device_id not in self._devices:
+                    raise ServiceError(
+                        f"device {device_id!r} not found",
+                        code="device_not_found",
+                        status=404,
+                    )
+            if expected_version is not None and expected_version != group["version"]:
+                raise ServiceError(
+                    f"group version conflict: expected {expected_version}, "
+                    f"current {group['version']}",
+                    code="group_version_conflict",
+                    status=409,
+                )
+            # 整体替换成员；即使成员完全相同版本也照常加一。
+            group["device_ids"] = device_ids
+            group["version"] += 1
+            return self._public_group(group)
+
+    # ------------------------------------------------------------------
+    # 命令批次：对受理时的组成员快照下发命令
+    # ------------------------------------------------------------------
+
+    def _mint_batch_id_locked(self) -> str:
+        batch_id = secrets.token_urlsafe(18)
+        while batch_id in self._issued_batch_ids:
+            batch_id = secrets.token_urlsafe(18)
+        self._issued_batch_ids.add(batch_id)
+        return batch_id
+
+    @staticmethod
+    def _public_batch_created(batch: dict) -> dict:
+        """批次受理视图：按成员顺序排列的 device_id 与 command_id。"""
+        return {
+            "batch_id": batch["batch_id"],
+            "group_id": batch["group_id"],
+            "group_version": batch["group_version"],
+            "request_id": batch["request_id"],
+            "commands": [
+                {"device_id": device_id, "command_id": command_id}
+                for device_id, command_id in zip(
+                    batch["device_ids"], batch["command_ids"]
+                )
+            ],
+        }
+
+    def create_command_batch(self, group_id: str, payload: object) -> dict:
+        data = self._require_fields(
+            payload,
+            {"command_name", "payload", "ttl_seconds", "request_id"},
+            optional={"expected_group_version"},
+        )
+        command_name = _validate_command_name(data["command_name"])
+        # payload 可为任意 JSON 值（null、标量、数组或对象），原样保留。
+        command_payload = data["payload"]
+        ttl_seconds = _validate_ttl_seconds(data["ttl_seconds"])
+        request_id = _validate_request_id(data["request_id"])
+        expected_group_version = None
+        if "expected_group_version" in data:
+            expected_group_version = self._validate_expected_group_version(
+                data["expected_group_version"]
+            )
+
+        with self._lock:
+            group = self._groups.get(group_id)
+            if group is None:
+                raise ServiceError(
+                    f"device group {group_id!r} not found",
+                    code="group_not_found",
+                    status=404,
+                )
+            # 同组重复 request_id：内容相同幂等返回原批次（锁内判定与创建，
+            # 并发相同请求至多创建一个批次）；内容不同拒绝且不产生任何命令。
+            requests = self._group_request_ids.setdefault(group_id, {})
+            existing_batch_id = requests.get(request_id)
+            if existing_batch_id is not None:
+                existing = self._batches[existing_batch_id]
+                if (
+                    existing["command_name"] == command_name
+                    and _json_equal(existing["payload"], command_payload)
+                    and existing["ttl_seconds"] == ttl_seconds
+                ):
+                    return self._public_batch_created(existing)
+                raise ServiceError(
+                    f"request {request_id!r} conflicts with an existing batch",
+                    code="batch_request_conflict",
+                    status=409,
+                )
+            if (
+                expected_group_version is not None
+                and expected_group_version != group["version"]
+            ):
+                raise ServiceError(
+                    f"group version conflict: expected {expected_group_version}, "
+                    f"current {group['version']}",
+                    code="group_version_conflict",
+                    status=409,
+                )
+            # 受理时快照成员；含已吊销成员则整体失败，不创建任何命令。
+            member_ids = list(group["device_ids"])
+            for device_id in member_ids:
+                device = self._devices.get(device_id)
+                if device is None or not device["active"]:
+                    raise ServiceError(
+                        f"device group {group_id!r} contains revoked device "
+                        f"{device_id!r}",
+                        code="group_contains_revoked_device",
+                        status=409,
+                    )
+            now = _utc_now()
+            command_ids: list[str] = []
+            for device_id in member_ids:
+                command = self._create_command_locked(
+                    device_id, command_name, command_payload, ttl_seconds, now
+                )
+                command_ids.append(command["command_id"])
+            batch = {
+                "batch_id": self._mint_batch_id_locked(),
+                "group_id": group_id,
+                # 受理时采用的组版本；后续成员替换不影响本批次。
+                "group_version": group["version"],
+                "request_id": request_id,
+                "command_name": command_name,
+                "payload": copy.deepcopy(command_payload),
+                "ttl_seconds": ttl_seconds,
+                "device_ids": member_ids,
+                "command_ids": command_ids,
+            }
+            self._batches[batch["batch_id"]] = batch
+            requests[request_id] = batch["batch_id"]
+            return self._public_batch_created(batch)
+
+    def get_command_batch(self, group_id: str | None, batch_id: str) -> dict:
+        with self._lock:
+            if group_id is not None and group_id not in self._groups:
+                raise ServiceError(
+                    f"device group {group_id!r} not found",
+                    code="group_not_found",
+                    status=404,
+                )
+            batch = self._batches.get(batch_id)
+            if batch is None or (
+                group_id is not None and batch["group_id"] != group_id
+            ):
+                raise ServiceError(
+                    f"command batch {batch_id!r} not found",
+                    code="batch_not_found",
+                    status=404,
+                )
+            now = _utc_now()
+            commands: list[dict] = []
+            counts = {
+                "queued": 0,
+                "delivered": 0,
+                "succeeded": 0,
+                "failed": 0,
+                "expired": 0,
+                "cancelled": 0,
+            }
+            # 按创建时成员顺序返回子命令当前快照，并汇总各状态数量。
+            for command_id in batch["command_ids"]:
+                command = self._commands[command_id]
+                self._expire_command_locked(command, now)
+                commands.append(self._public_command_locked(command))
+                counts[command["status"]] += 1
+            return {
+                "batch_id": batch["batch_id"],
+                "group_id": batch["group_id"],
+                "group_version": batch["group_version"],
+                "request_id": batch["request_id"],
+                "commands": commands,
+                "counts": counts,
+            }
+
+    @staticmethod
+    def _validate_expected_group_version(value: object) -> int:
+        # bool 是 int 的子类，须显式排除；只接受非负整数。
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ServiceError(
+                "expected_group_version must be a non-negative integer"
+            )
+        return value

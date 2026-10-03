@@ -57,6 +57,23 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/v1/rules":
             self.handle_service_call(lambda: (200, self.service.list_rules()))
             return
+        batch_ids = self._extract_group_batch_ids(self.path)
+        if batch_ids is not None:
+            group_id, batch_id = batch_ids
+            self.handle_service_call(
+                lambda: (200, self.service.get_command_batch(group_id, batch_id))
+            )
+            return
+        batch_id = self._extract_batch_id(self.path)
+        if batch_id is not None:
+            self.handle_service_call(
+                lambda: (200, self.service.get_command_batch(None, batch_id))
+            )
+            return
+        group_id = self._extract_group_id(self.path)
+        if group_id is not None:
+            self.handle_service_call(lambda: (200, self.service.get_group(group_id)))
+            return
         command_ids = self._extract_device_command_ids(self.path)
         if command_ids is not None:
             device_id, command_id = command_ids
@@ -87,6 +104,14 @@ class Handler(BaseHTTPRequestHandler):
                 )
             self.handle_service_call(action)
             return
+        group_id = self._extract_group_id(self.path)
+        if group_id is not None:
+            def action() -> tuple[int, dict]:
+                return 200, self.service.replace_group_members(
+                    group_id, self.read_json_object()
+                )
+            self.handle_service_call(action)
+            return
         device_id = self._extract_device_id(self.path, "/shadow/desired")
         if device_id is not None:
             def action() -> tuple[int, dict]:
@@ -107,6 +132,19 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/v1/rules":
             def action() -> tuple[int, dict]:
                 return 201, self.service.create_rule(self.read_json_object())
+            self.handle_service_call(action)
+            return
+        if path == "/v1/device-groups":
+            def action() -> tuple[int, dict]:
+                return 201, self.service.create_group(self.read_json_object())
+            self.handle_service_call(action)
+            return
+        group_id = self._extract_group_id(path, "/command-batches")
+        if group_id is not None:
+            def action() -> tuple[int, dict]:
+                return 202, self.service.create_command_batch(
+                    group_id, self.read_json_object()
+                )
             self.handle_service_call(action)
             return
         if path == "/v1/device-auth":
@@ -221,6 +259,27 @@ class Handler(BaseHTTPRequestHandler):
         return None
 
     @staticmethod
+    def _extract_group_id(path: str, suffix: str = "") -> str | None:
+        prefix = "/v1/device-groups/"
+        if not path.startswith(prefix) or not path.endswith(suffix):
+            return None
+        end = len(path) - len(suffix) if suffix else len(path)
+        segment = path[len(prefix):end]
+        if segment and all(ch.isascii() and (ch.isalnum() or ch in "._-") for ch in segment):
+            return segment
+        return None
+
+    @staticmethod
+    def _extract_batch_id(path: str) -> str | None:
+        prefix = "/v1/command-batches/"
+        if not path.startswith(prefix):
+            return None
+        segment = path[len(prefix):]
+        if segment and all(ch.isascii() and (ch.isalnum() or ch in "._-") for ch in segment):
+            return segment
+        return None
+
+    @staticmethod
     def _extract_rule_id(path: str, suffix: str = "") -> str | None:
         prefix = "/v1/rules/"
         if not path.startswith(prefix) or not path.endswith(suffix):
@@ -236,6 +295,18 @@ class Handler(BaseHTTPRequestHandler):
         return bool(segment) and all(
             ch.isascii() and (ch.isalnum() or ch in "._-") for ch in segment
         )
+
+    @classmethod
+    def _extract_group_batch_ids(cls, path: str) -> tuple[str, str] | None:
+        """匹配 /v1/device-groups/{group_id}/command-batches/{batch_id}。"""
+        prefix = "/v1/device-groups/"
+        marker = "/command-batches/"
+        if not path.startswith(prefix) or marker not in path:
+            return None
+        group_segment, _, batch_segment = path[len(prefix):].partition(marker)
+        if cls._valid_id_segment(group_segment) and cls._valid_id_segment(batch_segment):
+            return group_segment, batch_segment
+        return None
 
     @classmethod
     def _extract_device_command_ids(cls, path: str) -> tuple[str, str] | None:
