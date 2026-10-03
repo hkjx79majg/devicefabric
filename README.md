@@ -98,10 +98,29 @@ PYTHONPATH=src python3 -m devicefabric.server --host 127.0.0.1 --port 8080
 
 轮询与确认沿用现有会话鉴权及保活语义：未知会话 `404`（`session_not_found`）、令牌错误 `401`（`invalid_session_token`）、会话已 `closed` 或 `expired` 返回 `409`（`session_not_online`）。非 JSON 对象、字段缺失或多余、`command_name`/`ttl_seconds`/`max_commands`/`status` 非法均返回 `400`（`invalid_request`），且不改变任何命令状态。
 
+## 设备组与组命令批次
+
+设备组与批次仅保存在当前进程内，服务重启即清空。设备吊销**不**将其移出任何组。
+
+### 设备组
+
+- `POST /v1/device-groups`：请求体为 `{"group_id": ..., "device_ids": [...]}`，两个字段均必填且不得含未知字段。`group_id` 沿用 `device_id` 标识规则（1-64 个 ASCII 字母、数字、点、下划线或短横线）；`device_ids` 为数组，每项沿用 `device_id` 标识规则，且不得重复（顺序保留，允许空数组）。所有成员必须是已注册设备（含已吊销设备），任一不存在返回 `404`（`device_not_found`）且不建组。成功返回 `201` 与 `{"group_id", "version": 1, "device_ids": ...}`，成员按请求顺序排列。重名返回 `409`（`group_already_exists`），原记录不变。
+- `GET /v1/device-groups/{group_id}`：返回 `200` 与组快照；组不存在返回 `404`（`group_not_found`）。
+- `PUT /v1/device-groups/{group_id}/members`：请求体为 `{"device_ids": [...]}`，可选非负整数 `expected_version`。整体替换成员（非合并），成功返回 `200` 与更新后的组快照，`version` 加一；即使新成员与现有成员完全相同也照常递增。提供 `expected_version` 时其值必须等于替换前的版本，否则返回 `409`（`group_version_conflict`）；组不存在返回 `404`（`group_not_found`）；成员含未注册设备返回 `404`（`device_not_found`）。任一失败均不改变组。
+
+### 命令批次
+
+- `POST /v1/device-groups/{group_id}/command-batches`：请求体为 `{"request_id": ..., "command_name": ..., "payload": ..., "ttl_seconds": ...}`，可带非负整数 `expected_group_version`，不得含其他未知字段。`request_id` 为 1-64 个字符的字符串；`command_name`、`payload`、`ttl_seconds` 沿用单设备命令规则。受理时对**当时成员快照**下发：成功返回 `202` 与 `{"batch_id", "group_version", "commands"}`，`batch_id` 唯一且不可预测，`group_version` 为采用的组版本，`commands` 为按成员顺序排列的 `{"device_id", "command_id"}`；空组也创建零项批次，`commands` 为空数组。子命令即普通设备命令（初始 `queued`），由既有的轮询、重领、确认与单命令查询入口处理。
+  - 组不存在返回 `404`（`group_not_found`）；提供 `expected_group_version` 且与当前版本不符返回 `409`（`group_version_conflict`）；受理时成员中含已吊销设备返回 `409`（`group_contains_revoked_device`）。这些失败均不创建任何子命令或批次。
+  - 幂等：同一组内相同 `request_id` 且内容（`command_name`、`payload`、`ttl_seconds`）相同的重复请求返回原批次（含原 `batch_id` 与子命令列表，HTTP `202`），不重复创建命令；内容不同返回 `409`（`batch_request_conflict`）。`request_id` 的作用域为单个组；并发的相同请求至多创建一个批次。
+- `GET /v1/device-groups/{group_id}/command-batches/{batch_id}`：返回 `200` 与 `{"batch_id", "group_version", "commands", "status_counts"}`。`commands` 按批次创建时的成员顺序返回各子命令的**当前完整快照**（成员后续变化不影响旧批次）；`status_counts` 汇总 `queued`、`delivered`、`succeeded`、`failed`、`expired`、`cancelled` 六个状态的当前数量（零项批次均为 `0`）。批次不存在或属于其他组返回 `404`（`batch_not_found`）。
+
+设备吊销按既有规则取消批次中的非终态子命令，已终态子命令不变；子命令到达 `expires_at` 时在批次查询中按既有规则转为 `expired`。非 JSON 对象、缺失或未知字段、重复成员、非法 `group_id`/`device_ids`/版本/`request_id`/命令字段均返回 `400`（`invalid_request`）且状态不变，错误体沿用 `{"error": {"code": ..., "message": ...}}`。
+
 ## 验证
 
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-当前测试覆盖健康检查基线与设备注册、凭据认证、轮换、吊销、连接会话、心跳保活、MQTT 风格主题订阅、发布（QoS 0 与 QoS 1）、拉取、重投与确认、设备影子的期望/实际状态写入、差异计算、版本冲突与会话鉴权，以及规则引擎的创建、列表、启停、删除、字段校验、条件评估与动作投递（含顺序、QoS、不递归触发、回放不触发）的成功与失败语义；另覆盖 `clean_start=false` 持久会话的建立、离线 QoS 1 队列、每组合一份与独立 delivery_id、`matched_count` 口径、重连后的顺序与 dup 重投、确认历史、保留消息不回放、`clean_start=true` 清状态、非布尔值拒绝且无副作用，以及凭据轮换保留与设备吊销清除；并覆盖设备命令的下发、按创建顺序领取、dup 重领、归属转移、确认与幂等、过期与吊销取消、字段校验与会话鉴权语义。
+当前测试覆盖健康检查基线与设备注册、凭据认证、轮换、吊销、连接会话、心跳保活、MQTT 风格主题订阅、发布（QoS 0 与 QoS 1）、拉取、重投与确认、设备影子的期望/实际状态写入、差异计算、版本冲突与会话鉴权，以及规则引擎的创建、列表、启停、删除、字段校验、条件评估与动作投递（含顺序、QoS、不递归触发、回放不触发）的成功与失败语义；另覆盖 `clean_start=false` 持久会话的建立、离线 QoS 1 队列、每组合一份与独立 delivery_id、`matched_count` 口径、重连后的顺序与 dup 重投、确认历史、保留消息不回放、`clean_start=true` 清状态、非布尔值拒绝且无副作用，以及凭据轮换保留与设备吊销清除；并覆盖设备命令的下发、按创建顺序领取、dup 重领、归属转移、确认与幂等、过期与吊销取消、字段校验与会话鉴权语义；另覆盖设备组的创建、查询、整体替换、乐观版本与各类冲突（含重名、版本不符、组/设备不存在、重复或非法成员、吊销不移除成员），以及组命令批次的成员快照下发、空组零项批次、不可预测 batch_id、按成员顺序的结果、expected_group_version 冲突、含吊销成员整体拒绝、同组 request_id 幂等与内容冲突、并发至多一个批次、批次查询的子命令当前快照与六状态汇总、成员变化不影响旧批次、吊销按既有规则取消非终态子命令，以及子命令经既有轮询/重领/确认/单命令查询入口处理的端到端语义。

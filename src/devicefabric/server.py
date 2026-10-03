@@ -9,6 +9,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .service import Service, ServiceError
 
+# 路径匹配到了对应路由但标识符段非法：返回 400（invalid_request），
+# 而不是按未匹配处理为 404。
+INVALID_ID_SEGMENT = object()
+
 
 def env_address() -> tuple[str, int]:
     raw = os.environ.get("DEVICEFABRIC_ADDR", "127.0.0.1:8080")
@@ -57,6 +61,23 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/v1/rules":
             self.handle_service_call(lambda: (200, self.service.list_rules()))
             return
+        group_batch = self._extract_group_batch_ids(self.path)
+        if group_batch is not None:
+            if group_batch is INVALID_ID_SEGMENT:
+                self.send_invalid_identifier()
+                return
+            group_id, batch_id = group_batch
+            self.handle_service_call(
+                lambda: (200, self.service.get_command_batch(group_id, batch_id))
+            )
+            return
+        group_id = self._extract_group_id(self.path)
+        if group_id is not None:
+            if group_id is INVALID_ID_SEGMENT:
+                self.send_invalid_identifier()
+                return
+            self.handle_service_call(lambda: (200, self.service.get_group(group_id)))
+            return
         command_ids = self._extract_device_command_ids(self.path)
         if command_ids is not None:
             device_id, command_id = command_ids
@@ -79,6 +100,17 @@ class Handler(BaseHTTPRequestHandler):
         self.send_not_found()
 
     def do_PUT(self) -> None:
+        group_members = self._extract_group_id(self.path, "/members")
+        if group_members is not None:
+            if group_members is INVALID_ID_SEGMENT:
+                self.send_invalid_identifier()
+                return
+            def action() -> tuple[int, dict]:
+                return 200, self.service.replace_group_members(
+                    group_members, self.read_json_object()
+                )
+            self.handle_service_call(action)
+            return
         rule_id = self._extract_rule_id(self.path, "/enabled")
         if rule_id is not None:
             def action() -> tuple[int, dict]:
@@ -112,6 +144,23 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/v1/device-auth":
             def action() -> tuple[int, dict]:
                 return 200, self.service.authenticate(self.read_json_object())
+            self.handle_service_call(action)
+            return
+        if path == "/v1/device-groups":
+            def action() -> tuple[int, dict]:
+                return 201, self.service.create_group(self.read_json_object())
+            self.handle_service_call(action)
+            return
+        group_batches = self._extract_group_id(path, "/command-batches")
+        if group_batches is not None:
+            if group_batches is INVALID_ID_SEGMENT:
+                self.send_invalid_identifier()
+                return
+            group_id: str = group_batches
+            def action() -> tuple[int, dict]:
+                return 202, self.service.create_command_batch(
+                    group_id, self.read_json_object()
+                )
             self.handle_service_call(action)
             return
         if path == "/v1/device-sessions":
@@ -198,6 +247,14 @@ class Handler(BaseHTTPRequestHandler):
     def send_not_found(self) -> None:
         self.send_error_json(404, "not_found", f"no route for {self.path}")
 
+    def send_invalid_identifier(self) -> None:
+        self.send_error_json(
+            400,
+            "invalid_request",
+            "identifier must be 1-64 ASCII letters, digits, dots, "
+            "underscores or hyphens",
+        )
+
     @staticmethod
     def _extract_device_id(path: str, suffix: str = "") -> str | None:
         prefix = "/v1/devices/"
@@ -230,6 +287,49 @@ class Handler(BaseHTTPRequestHandler):
         if segment and all(ch.isascii() and (ch.isalnum() or ch in "._-") for ch in segment):
             return segment
         return None
+
+    @staticmethod
+    def _extract_group_id(path: str, suffix: str = "") -> str | object | None:
+        """匹配 /v1/device-groups/{group_id}[/suffix]。
+
+        路径形状不匹配返回 None；匹配但 group_id 段非法返回
+        INVALID_ID_SEGMENT（调用方据此回 400）；否则返回合法 group_id。
+        """
+        prefix = "/v1/device-groups/"
+        if not path.startswith(prefix) or not path.endswith(suffix):
+            return None
+        end = len(path) - len(suffix) if suffix else len(path)
+        segment = path[len(prefix):end]
+        # 多段路径不匹配本路由形状（交由后续路由，最终 404）；单段非法
+        # 标识则为 400。
+        if not segment or "/" in segment:
+            return None
+        if Handler._valid_id_segment(segment):
+            return segment
+        return INVALID_ID_SEGMENT
+
+    @classmethod
+    def _extract_group_batch_ids(cls, path: str) -> tuple[str, str] | object | None:
+        """匹配 /v1/device-groups/{group_id}/command-batches/{batch_id}。
+
+        形状不匹配返回 None；两个标识均为单段但任一非法返回
+        INVALID_ID_SEGMENT。
+        """
+        prefix = "/v1/device-groups/"
+        marker = "/command-batches/"
+        if not path.startswith(prefix) or marker not in path:
+            return None
+        group_segment, _, batch_segment = path[len(prefix):].partition(marker)
+        if not group_segment or not batch_segment:
+            return None
+        if "/" in group_segment or "/" in batch_segment:
+            return None
+        if not (
+            cls._valid_id_segment(group_segment)
+            and cls._valid_id_segment(batch_segment)
+        ):
+            return INVALID_ID_SEGMENT
+        return group_segment, batch_segment
 
     @staticmethod
     def _valid_id_segment(segment: str) -> bool:
