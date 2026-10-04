@@ -60,6 +60,27 @@ COMMAND_ACK_STATUSES = frozenset({"succeeded", "failed"})
 REQUEST_ID_MIN = 1
 REQUEST_ID_MAX = 64
 
+FIRMWARE_VERSION_MIN = 1
+FIRMWARE_VERSION_MAX = 128
+DOWNLOAD_URL_MIN = 1
+DOWNLOAD_URL_MAX = 2048
+# SHA-256 校验和：64 个十六进制字符（大小写均可）。
+SHA256_RE = re.compile(r"[0-9a-fA-F]{64}\Z")
+
+FIRMWARE_UPDATE_QUEUED = "queued"
+FIRMWARE_UPDATE_DELIVERED = "delivered"
+FIRMWARE_UPDATE_STATUSES = (
+    FIRMWARE_UPDATE_QUEUED,
+    FIRMWARE_UPDATE_DELIVERED,
+    "installed",
+    "failed",
+    "cancelled",
+)
+FIRMWARE_UPDATE_NON_TERMINAL = frozenset(
+    {FIRMWARE_UPDATE_QUEUED, FIRMWARE_UPDATE_DELIVERED}
+)
+FIRMWARE_ACK_STATUSES = frozenset({"installed", "failed"})
+
 TELEMETRY_POINTS_MIN = 1
 TELEMETRY_POINTS_MAX = 500
 TELEMETRY_RESOLUTIONS = frozenset({"raw", "60", "300", "3600"})
@@ -259,6 +280,34 @@ def _validate_request_id(value: object) -> str:
         raise ServiceError("request_id must be a string")
     if not REQUEST_ID_MIN <= len(value) <= REQUEST_ID_MAX:
         raise ServiceError(f"request_id must be {REQUEST_ID_MIN}-{REQUEST_ID_MAX} characters")
+    return value
+
+
+def _validate_firmware_version(value: object) -> str:
+    if not isinstance(value, str) or isinstance(value, bool):
+        raise ServiceError("version must be a string")
+    if not FIRMWARE_VERSION_MIN <= len(value) <= FIRMWARE_VERSION_MAX:
+        raise ServiceError(
+            f"version must be {FIRMWARE_VERSION_MIN}-{FIRMWARE_VERSION_MAX} characters"
+        )
+    return value
+
+
+def _validate_download_url(value: object) -> str:
+    if not isinstance(value, str) or isinstance(value, bool):
+        raise ServiceError("download_url must be a string")
+    if not DOWNLOAD_URL_MIN <= len(value) <= DOWNLOAD_URL_MAX:
+        raise ServiceError(
+            f"download_url must be {DOWNLOAD_URL_MIN}-{DOWNLOAD_URL_MAX} characters"
+        )
+    return value
+
+
+def _validate_sha256(value: object) -> str:
+    if not isinstance(value, str) or isinstance(value, bool):
+        raise ServiceError("sha256 must be a string")
+    if not SHA256_RE.match(value):
+        raise ServiceError("sha256 must be 64 hexadecimal characters")
     return value
 
 
@@ -477,6 +526,20 @@ class Service:
         self._group_requests: dict[tuple[str, str], str] = {}
         # 记录本进程签发过的全部批次 ID，保证批次在进程内绝不重复。
         self._issued_batch_ids: set[str] = set()
+        # 进程内固件发布：release_id -> 发布记录。发布创建后不可变，
+        # 不提供修改或删除。重启即清空。
+        self._firmware_releases: dict[str, dict] = {}
+        # 进程内固件更新：update_id -> 更新记录；另按设备保存受理顺序的
+        # update_id 列表，供设备按序领取最早更新。设备吊销时非终态更新
+        # 变为 cancelled。重启即清空。
+        self._firmware_updates: dict[str, dict] = {}
+        self._device_update_ids: dict[str, list[str]] = {}
+        # 进程内固件下发批次：rollout_id -> 批次记录。成员顺序与组版本
+        # 为受理时快照，组的后续变化不影响本批次。重启即清空。
+        self._rollouts: dict[str, dict] = {}
+        # 记录本进程签发过的全部更新 ID 与批次 ID，保证进程内绝不重复。
+        self._issued_update_ids: set[str] = set()
+        self._issued_rollout_ids: set[str] = set()
         # 时序遥测：按受理顺序保存的全部数据点，每项为
         # {"device_id", "metric", "ts"(UTC datetime), "value", "seq"}；
         # seq 全局单调递增，同时间戳的点按受理顺序排列。凭据轮换、会话
@@ -612,6 +675,10 @@ class Service:
                 "created_at": _rfc3339_utc(_utc_now()),
                 "credential_version": 1,
                 "credential": credential,
+                # 设备当前固件：初始无固件；确认 installed 后更新为对应
+                # 发布（安装旧发布即回滚，不做版本比较）。仅进程内记录。
+                "firmware_release_id": None,
+                "firmware_version": None,
             }
             self._devices[device_id] = device
             # 注册即初始化空影子：version 为 0、三个状态为空对象、
@@ -718,6 +785,12 @@ class Service:
                 self._expire_command_locked(command, now)
                 if command["status"] in COMMAND_NON_TERMINAL:
                     command["status"] = "cancelled"
+            # 吊销同时使该设备全部非终态固件更新变为 cancelled；已终态
+            # （installed/failed）的更新保持不变。
+            for update_id in self._device_update_ids.get(device_id, []):
+                update = self._firmware_updates[update_id]
+                if update["status"] in FIRMWARE_UPDATE_NON_TERMINAL:
+                    update["status"] = "cancelled"
             return self._public_device(device)
 
     # ------------------------------------------------------------------
@@ -2011,6 +2084,302 @@ class Service:
                     status=404,
                 )
             return self._public_batch_status_locked(batch, _utc_now())
+
+    # ------------------------------------------------------------------
+    # 固件 OTA：发布登记、组下发与设备领取/确认
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _public_firmware_release_locked(release: dict) -> dict:
+        """发布完整视图；发布创建后不可变。"""
+        return {
+            "release_id": release["release_id"],
+            "version": release["version"],
+            "download_url": release["download_url"],
+            "sha256": release["sha256"],
+            "created_at": _rfc3339_utc(release["created_at"]),
+        }
+
+    def create_firmware_release(self, payload: object) -> dict:
+        data = self._require_fields(
+            payload, {"release_id", "version", "download_url", "sha256"}
+        )
+        release_id = _validate_identifier(data["release_id"], "release_id")
+        version = _validate_firmware_version(data["version"])
+        download_url = _validate_download_url(data["download_url"])
+        sha256 = _validate_sha256(data["sha256"])
+
+        with self._lock:
+            # 发布不可变：重名一律冲突，即使内容完全相同也不覆盖。
+            if release_id in self._firmware_releases:
+                raise ServiceError(
+                    f"firmware release {release_id!r} already exists",
+                    code="firmware_release_already_exists",
+                    status=409,
+                )
+            release = {
+                "release_id": release_id,
+                "version": version,
+                "download_url": download_url,
+                "sha256": sha256,
+                "created_at": _utc_now(),
+            }
+            self._firmware_releases[release_id] = release
+            return self._public_firmware_release_locked(release)
+
+    def _mint_update_id_locked(self) -> str:
+        update_id = secrets.token_urlsafe(18)
+        while update_id in self._issued_update_ids:
+            update_id = secrets.token_urlsafe(18)
+        self._issued_update_ids.add(update_id)
+        return update_id
+
+    def _mint_rollout_id_locked(self) -> str:
+        rollout_id = secrets.token_urlsafe(18)
+        while rollout_id in self._issued_rollout_ids:
+            rollout_id = secrets.token_urlsafe(18)
+        self._issued_rollout_ids.add(rollout_id)
+        return rollout_id
+
+    @staticmethod
+    def _public_firmware_update_locked(update: dict) -> dict:
+        """更新完整快照；发布字段在受理时固化（发布本身不可变）。"""
+        return {
+            "update_id": update["update_id"],
+            "rollout_id": update["rollout_id"],
+            "device_id": update["device_id"],
+            "release_id": update["release_id"],
+            "version": update["version"],
+            "download_url": update["download_url"],
+            "sha256": update["sha256"],
+            "status": update["status"],
+            "created_at": _rfc3339_utc(update["created_at"]),
+            "completed_at": (
+                _rfc3339_utc(update["completed_at"])
+                if update["completed_at"] is not None
+                else None
+            ),
+        }
+
+    def create_firmware_rollout(self, group_id: str, payload: object) -> dict:
+        data = self._require_fields(
+            payload, {"release_id"}, optional={"expected_group_version"}
+        )
+        release_id = _validate_identifier(data["release_id"], "release_id")
+        expected_version = None
+        if "expected_group_version" in data:
+            expected_version = self._validate_expected_version(
+                data["expected_group_version"]
+            )
+
+        with self._lock:
+            group = self._groups.get(group_id)
+            if group is None:
+                raise ServiceError(
+                    f"group {group_id!r} not found",
+                    code="group_not_found",
+                    status=404,
+                )
+            release = self._firmware_releases.get(release_id)
+            if release is None:
+                raise ServiceError(
+                    f"firmware release {release_id!r} not found",
+                    code="firmware_release_not_found",
+                    status=404,
+                )
+            if expected_version is not None and expected_version != group["version"]:
+                raise ServiceError(
+                    f"group version conflict: expected {expected_version}, "
+                    f"current {group['version']}",
+                    code="group_version_conflict",
+                    status=409,
+                )
+            members = list(group["device_ids"])
+            # 受理时成员中含已吊销设备：整批拒绝，不创建任何更新。
+            for device_id in members:
+                device = self._devices.get(device_id)
+                if device is None or not device["active"]:
+                    raise ServiceError(
+                        f"group {group_id!r} contains revoked device {device_id!r}",
+                        code="group_contains_revoked_device",
+                        status=409,
+                    )
+            now = _utc_now()
+            rollout = {
+                "rollout_id": self._mint_rollout_id_locked(),
+                "group_id": group_id,
+                "release_id": release_id,
+                # 采用受理时的成员顺序与组版本（快照，组的后续变化不影响
+                # 本批次）。空组也成功，仅没有成员更新。
+                "group_version": group["version"],
+                "device_ids": members,
+                "update_ids": [],
+                "created_at": now,
+            }
+            for device_id in members:
+                update = {
+                    "update_id": self._mint_update_id_locked(),
+                    "rollout_id": rollout["rollout_id"],
+                    "device_id": device_id,
+                    "release_id": release_id,
+                    "version": release["version"],
+                    "download_url": release["download_url"],
+                    "sha256": release["sha256"],
+                    "status": FIRMWARE_UPDATE_QUEUED,
+                    "created_at": now,
+                    "completed_at": None,
+                    # 当前领取该更新的会话；仅 queued/delivered 状态下有意义。
+                    "owner_session_id": None,
+                }
+                self._firmware_updates[update["update_id"]] = update
+                self._device_update_ids.setdefault(device_id, []).append(
+                    update["update_id"]
+                )
+                rollout["update_ids"].append(update["update_id"])
+            self._rollouts[rollout["rollout_id"]] = rollout
+            return {
+                "rollout_id": rollout["rollout_id"],
+                "release_id": release_id,
+                "group_version": rollout["group_version"],
+                "updates": [
+                    {"device_id": device_id, "update_id": update_id}
+                    for device_id, update_id in zip(
+                        rollout["device_ids"], rollout["update_ids"]
+                    )
+                ],
+            }
+
+    def get_firmware_rollout(self, group_id: str, rollout_id: str) -> dict:
+        with self._lock:
+            rollout = self._rollouts.get(rollout_id)
+            if rollout is None or rollout["group_id"] != group_id:
+                raise ServiceError(
+                    f"rollout {rollout_id!r} not found",
+                    code="rollout_not_found",
+                    status=404,
+                )
+            counts = {status: 0 for status in FIRMWARE_UPDATE_STATUSES}
+            updates: list[dict] = []
+            for update_id in rollout["update_ids"]:
+                update = self._firmware_updates[update_id]
+                counts[update["status"]] += 1
+                updates.append(self._public_firmware_update_locked(update))
+            return {
+                "rollout_id": rollout["rollout_id"],
+                "release_id": rollout["release_id"],
+                "group_version": rollout["group_version"],
+                "updates": updates,
+                "status_counts": counts,
+            }
+
+    def poll_firmware_update(self, session_id: str, payload: object) -> dict:
+        data = self._require_fields(payload, {"session_token"})
+        token = data["session_token"]
+        if not isinstance(token, str) or isinstance(token, bool):
+            raise ServiceError("session_token must be a string")
+
+        with self._lock:
+            now = _utc_now()
+            # 沿用会话鉴权及保活规则：未知 404、令牌错误 401、已离线 409。
+            session = self._authenticate_online_session_locked(
+                session_id, token, now
+            )
+            # 按受理顺序领取本设备最早的非终态更新；单个更新在任一时刻
+            # 至多归属一个在线会话（锁内完成判定与归属转移）。
+            for update_id in self._device_update_ids.get(session["device_id"], []):
+                update = self._firmware_updates[update_id]
+                if update["status"] == FIRMWARE_UPDATE_QUEUED:
+                    # 首次领取：转为 delivered，dup 为 false。
+                    update["status"] = FIRMWARE_UPDATE_DELIVERED
+                    update["owner_session_id"] = session["session_id"]
+                    dup = False
+                elif update["status"] == FIRMWARE_UPDATE_DELIVERED:
+                    owner_id = update["owner_session_id"]
+                    if owner_id == session["session_id"]:
+                        # 确认前由同一会话重领：update_id 不变，dup 为 true。
+                        dup = True
+                    else:
+                        owner = self._sessions.get(owner_id)
+                        if owner is not None:
+                            self._expire_if_timed_out_locked(owner, now)
+                        if owner is not None and owner["state"] == SESSION_ONLINE:
+                            # 仍归属另一在线会话，本会话不得领取。
+                            continue
+                        # 领取会话已超时或被替换：归属转移，仍为重复投递。
+                        update["owner_session_id"] = session["session_id"]
+                        dup = True
+                else:
+                    # 终态更新（installed/failed/cancelled）不再领取。
+                    continue
+                item = self._public_firmware_update_locked(update)
+                item["dup"] = dup
+                return {"update": item}
+            # 无待领取更新：200 且 update 为 null。
+            return {"update": None}
+
+    def ack_firmware_update(
+        self, session_id: str, update_id: str, payload: object
+    ) -> dict:
+        data = self._require_fields(payload, {"session_token", "status"})
+        token = data["session_token"]
+        if not isinstance(token, str) or isinstance(token, bool):
+            raise ServiceError("session_token must be a string")
+        status = data["status"]
+        if (
+            not isinstance(status, str)
+            or isinstance(status, bool)
+            or status not in FIRMWARE_ACK_STATUSES
+        ):
+            raise ServiceError("status must be 'installed' or 'failed'")
+
+        with self._lock:
+            # 沿用会话鉴权及保活规则：未知 404、令牌错误 401、已离线 409。
+            session = self._authenticate_online_session_locked(
+                session_id, token, _utc_now()
+            )
+            update = self._firmware_updates.get(update_id)
+            # 其他设备的更新对本会话不可见，与不存在同等处理。
+            if update is None or update["device_id"] != session["device_id"]:
+                raise ServiceError(
+                    f"firmware update {update_id!r} not found",
+                    code="firmware_update_not_found",
+                    status=404,
+                )
+            current = update["status"]
+            if current in FIRMWARE_ACK_STATUSES:
+                # 已确认：相同状态幂等返回当前快照，状态冲突报错。
+                if current == status:
+                    return self._public_firmware_update_locked(update)
+                raise ServiceError(
+                    f"firmware update {update_id!r} already completed",
+                    code="firmware_update_already_completed",
+                    status=409,
+                )
+            if current == "cancelled":
+                raise ServiceError(
+                    f"firmware update {update_id!r} already completed",
+                    code="firmware_update_already_completed",
+                    status=409,
+                )
+            # 首次确认只接受当前领取会话；未投递（含投递给其他会话）拒绝。
+            if (
+                current == FIRMWARE_UPDATE_QUEUED
+                or update["owner_session_id"] != session["session_id"]
+            ):
+                raise ServiceError(
+                    f"firmware update {update_id!r} not delivered",
+                    code="firmware_update_not_delivered",
+                    status=409,
+                )
+            update["status"] = status
+            update["completed_at"] = _utc_now()
+            if status == "installed":
+                # 安装成功即更新设备当前固件；安装旧发布即为回滚，不做
+                # 版本比较。
+                device = self._devices[update["device_id"]]
+                device["firmware_release_id"] = update["release_id"]
+                device["firmware_version"] = update["version"]
+            return self._public_firmware_update_locked(update)
 
     # ------------------------------------------------------------------
     # 时序遥测：写入、幂等与固定窗口降采样查询
