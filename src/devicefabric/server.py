@@ -58,6 +58,12 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/healthz":
             self.send_json(200, self.service.health())
             return
+        audit = self._extract_audit_query(self.path)
+        if audit is not None:
+            self.handle_service_call(
+                lambda: (200, self.service.list_audit_events(audit))
+            )
+            return
         if self.path == "/v1/rules":
             self.handle_service_call(lambda: (200, self.service.list_rules()))
             return
@@ -313,6 +319,14 @@ class Handler(BaseHTTPRequestHandler):
             "identifier must be 1-64 ASCII letters, digits, dots, "
             "underscores or hyphens",
         )
+
+    @staticmethod
+    def _extract_audit_query(path: str) -> str | None:
+        """匹配 /v1/audit-events[?query]，返回查询串（可能为空串）。"""
+        bare, sep, query = path.partition("?")
+        if bare != "/v1/audit-events":
+            return None
+        return query if sep else ""
 
     @staticmethod
     def _extract_device_id(path: str, suffix: str = "") -> str | None:

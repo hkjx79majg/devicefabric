@@ -88,6 +88,23 @@ TELEMETRY_RAW_MAX_SECONDS = 24 * 3600
 TELEMETRY_DOWNSAMPLED_MAX_SECONDS = 31 * 24 * 3600
 TELEMETRY_PATH_ENV = "DEVICEFABRIC_TELEMETRY_PATH"
 
+# 变更审计：固定的可审计动作集合；resource_type 取 action 的点号前缀，
+# resource_id 取主资源标识。仅保留最近 AUDIT_RETENTION 条，淘汰后
+# sequence 继续单调增长、不复用。
+AUDIT_ACTION_DEVICE_CREATED = "device.created"
+AUDIT_ACTION_DEVICE_CREDENTIAL_ROTATED = "device.credential_rotated"
+AUDIT_ACTION_DEVICE_REVOKED = "device.revoked"
+AUDIT_ACTION_RULE_CREATED = "rule.created"
+AUDIT_ACTION_RULE_ENABLED_CHANGED = "rule.enabled_changed"
+AUDIT_ACTION_RULE_DELETED = "rule.deleted"
+AUDIT_ACTION_GROUP_CREATED = "group.created"
+AUDIT_ACTION_GROUP_MEMBERS_REPLACED = "group.members_replaced"
+AUDIT_ACTION_FIRMWARE_RELEASE_CREATED = "firmware_release.created"
+AUDIT_ACTION_FIRMWARE_ROLLOUT_CREATED = "firmware_rollout.created"
+AUDIT_RETENTION = 10000
+AUDIT_DEFAULT_LIMIT = 50
+AUDIT_MAX_LIMIT = 100
+
 # RFC 3339 时间戳：日期-时间以 T/t 分隔，必须携带 Z/z 或 ±HH:MM 时区偏移。
 _RFC3339_RE = re.compile(
     r"\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(\.\d+)?([Zz]|[+-]\d{2}:\d{2})\Z"
@@ -470,6 +487,84 @@ def _validate_rule_action(value: object) -> dict:
     return {"topic": topic, "payload": payload, "qos": qos}
 
 
+class AuditLog:
+    """进程内追加型变更审计日志。
+
+    事件按全局严格递增的 sequence（从 1 开始）保存，淘汰最旧事件后
+    sequence 仍继续增长、绝不复用。仅保存最近 AUDIT_RETENTION 条；
+    所有读写均在 Service 的同一把锁内进行，保证与业务状态变更原子。
+    进程重启即清空。事件只含 sequence、occurred_at、action、
+    resource_type、resource_id 五个字段，绝不记录凭据、会话令牌、
+    请求载荷或结果。
+    """
+
+    def __init__(self) -> None:
+        self._events: deque[dict] = deque()
+        self._next_sequence = 1
+
+    def append_locked(self, action: str, resource_id: str) -> None:
+        """在持锁状态下追加一条事件；resource_type 取点号前缀。"""
+        event = {
+            "sequence": self._next_sequence,
+            "occurred_at": _rfc3339_utc(_utc_now()),
+            "action": action,
+            "resource_type": action.partition(".")[0],
+            "resource_id": resource_id,
+        }
+        self._next_sequence += 1
+        self._events.append(event)
+        if len(self._events) > AUDIT_RETENTION:
+            self._events.popleft()
+
+    def oldest_sequence_locked(self) -> int | None:
+        return self._events[0]["sequence"] if self._events else None
+
+    def query_locked(
+        self,
+        after: int | None,
+        limit: int,
+        action: str | None,
+        resource_id: str | None,
+    ) -> dict:
+        """按 sequence 升序读取一页并返回 events 与 next_after。
+
+        after 早于现存最老事件的前一序号时抛 410
+        （audit_cursor_expired）；未传 after 则从现存最早事件读取。
+        """
+        oldest = self.oldest_sequence_locked()
+        if after is None:
+            cursor = (oldest - 1) if oldest is not None else 0
+        else:
+            # 现存最早事件序号为 oldest：after >= oldest 都可正常续读；
+            # after 严格小于 oldest 意味着它落在已淘汰区间内（最老事件
+            # 的前一序号 oldest-1 是合法的"从头读"游标，不报错）。
+            if oldest is not None and after < oldest - 1:
+                raise ServiceError(
+                    "audit cursor expired; oldest available sequence is "
+                    f"{oldest}",
+                    code="audit_cursor_expired",
+                    status=410,
+                )
+            cursor = after
+        events: list[dict] = []
+        for event in self._events:
+            if len(events) >= limit:
+                break
+            if event["sequence"] <= cursor:
+                continue
+            if action is not None and event["action"] != action:
+                continue
+            if resource_id is not None and event["resource_id"] != resource_id:
+                continue
+            events.append(dict(event))
+        if events:
+            next_after = events[-1]["sequence"]
+        else:
+            # 空页取入参 after；未传 after 时取 0。
+            next_after = after if after is not None else 0
+        return {"events": events, "next_after": next_after}
+
+
 class Service:
     """进程内设备注册与凭据生命周期服务。"""
 
@@ -556,6 +651,8 @@ class Service:
         self._telemetry_path = telemetry_path or None
         if self._telemetry_path is not None and os.path.exists(self._telemetry_path):
             self._load_telemetry()
+        # 变更审计日志：仅进程内保留最近 AUDIT_RETENTION 条，重启清空。
+        self._audit = AuditLog()
 
     def _load_telemetry(self) -> None:
         """从持久化文件恢复遥测数据与幂等记录（启动时调用，无需持锁）。"""
@@ -689,6 +786,7 @@ class Service:
                 "reported": {},
                 "updated_at": None,
             }
+            self._audit.append_locked(AUDIT_ACTION_DEVICE_CREATED, device_id)
             result = self._public_device(device)
             result["credential"] = credential
             return result
@@ -753,6 +851,9 @@ class Service:
             credential = self._mint_credential_locked()
             device["credential"] = credential
             device["credential_version"] += 1
+            self._audit.append_locked(
+                AUDIT_ACTION_DEVICE_CREDENTIAL_ROTATED, device_id
+            )
             result = self._public_device(device)
             result["credential"] = credential
             return result
@@ -766,8 +867,12 @@ class Service:
                     code="device_not_found",
                     status=404,
                 )
-            # 吊销是幂等的：重复调用保持状态与版本不变。
+            # 吊销是幂等的：重复调用保持状态与版本不变；仅首次真正
+            # 从 active 转为 revoked 时追加审计事件。
+            was_active = device["active"]
             device["active"] = False
+            if was_active:
+                self._audit.append_locked(AUDIT_ACTION_DEVICE_REVOKED, device_id)
             # 吊销立即关闭该设备的全部在线会话。
             for key, session_id in list(self._online_session_keys.items()):
                 if key[0] == device_id:
@@ -1563,6 +1668,7 @@ class Service:
             }
             self._rules[rule_id] = rule
             self._rule_order.append(rule_id)
+            self._audit.append_locked(AUDIT_ACTION_RULE_CREATED, rule_id)
             return self._public_rule_locked(rule)
 
     def list_rules(self) -> dict:
@@ -1594,7 +1700,12 @@ class Service:
                     code="rule_not_found",
                     status=404,
                 )
-            rule["enabled"] = enabled
+            # 幂等调用未变更（新旧 enabled 相同）时不追加审计事件。
+            if rule["enabled"] != enabled:
+                rule["enabled"] = enabled
+                self._audit.append_locked(
+                    AUDIT_ACTION_RULE_ENABLED_CHANGED, rule_id
+                )
             return self._public_rule_locked(rule)
 
     def delete_rule(self, rule_id: str) -> dict:
@@ -1607,6 +1718,7 @@ class Service:
                 )
             del self._rules[rule_id]
             self._rule_order.remove(rule_id)
+            self._audit.append_locked(AUDIT_ACTION_RULE_DELETED, rule_id)
             return {"deleted": True}
 
     # ------------------------------------------------------------------
@@ -1869,6 +1981,7 @@ class Service:
                 "device_ids": list(device_ids),
             }
             self._groups[group_id] = group
+            self._audit.append_locked(AUDIT_ACTION_GROUP_CREATED, group_id)
             return self._public_group_locked(group)
 
     def get_group(self, group_id: str) -> dict:
@@ -1917,9 +2030,13 @@ class Service:
                         code="device_not_found",
                         status=404,
                     )
-            # 整体替换：即使新成员与现有成员完全相同，版本也照常加一。
+            # 整体替换：即使新成员与现有成员完全相同，版本也照常加一，
+            # 因此每次成功提交都构成一次变更，均追加审计事件。
             group["device_ids"] = list(device_ids)
             group["version"] += 1
+            self._audit.append_locked(
+                AUDIT_ACTION_GROUP_MEMBERS_REPLACED, group_id
+            )
             return self._public_group_locked(group)
 
     # ------------------------------------------------------------------
@@ -2125,6 +2242,9 @@ class Service:
                 "created_at": _utc_now(),
             }
             self._firmware_releases[release_id] = release
+            self._audit.append_locked(
+                AUDIT_ACTION_FIRMWARE_RELEASE_CREATED, release_id
+            )
             return self._public_firmware_release_locked(release)
 
     def _mint_update_id_locked(self) -> str:
@@ -2237,6 +2357,9 @@ class Service:
                 )
                 rollout["update_ids"].append(update["update_id"])
             self._rollouts[rollout["rollout_id"]] = rollout
+            self._audit.append_locked(
+                AUDIT_ACTION_FIRMWARE_ROLLOUT_CREATED, rollout["rollout_id"]
+            )
             return {
                 "rollout_id": rollout["rollout_id"],
                 "release_id": release_id,
@@ -2568,3 +2691,44 @@ class Service:
                 }
             )
         return buckets
+
+    # ------------------------------------------------------------------
+    # 变更审计日志查询
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_non_negative_int(value: str, field: str) -> int:
+        # 仅接受十进制数字组成的非负整数：拒绝负号、小数点、空白、
+        # 正号或非 ASCII 数字。
+        if not value or not all("0" <= ch <= "9" for ch in value):
+            raise ServiceError(f"parameter {field} must be a non-negative integer")
+        return int(value)
+
+    def _parse_audit_query(self, query: str) -> tuple[int | None, int, str | None, str | None]:
+        """解析并校验审计查询参数；未知、重复、类型错误或越界均 400。"""
+        pairs = parse_qs(query, keep_blank_values=True)
+        unknown = set(pairs) - {"after", "limit", "action", "resource_id"}
+        if unknown:
+            raise ServiceError(f"unknown parameter(s): {', '.join(sorted(unknown))}")
+        for field in pairs:
+            if len(pairs[field]) != 1:
+                raise ServiceError(f"parameter {field} must appear exactly once")
+        after: int | None = None
+        if "after" in pairs:
+            after = self._parse_non_negative_int(pairs["after"][0], "after")
+        limit = AUDIT_DEFAULT_LIMIT
+        if "limit" in pairs:
+            limit = self._parse_non_negative_int(pairs["limit"][0], "limit")
+            if not 1 <= limit <= AUDIT_MAX_LIMIT:
+                raise ServiceError(
+                    f"parameter limit must be between 1 and {AUDIT_MAX_LIMIT}"
+                )
+        action = pairs["action"][0] if "action" in pairs else None
+        resource_id = pairs["resource_id"][0] if "resource_id" in pairs else None
+        return after, limit, action, resource_id
+
+    def list_audit_events(self, query: str) -> dict:
+        after, limit, action, resource_id = self._parse_audit_query(query)
+        with self._lock:
+            # 返回事件副本，调用方无法修改进程内审计记录。
+            return self._audit.query_locked(after, limit, action, resource_id)
