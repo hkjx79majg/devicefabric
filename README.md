@@ -129,10 +129,23 @@ PYTHONPATH=src python3 -m devicefabric.server --host 127.0.0.1 --port 8080
   - 数值分辨率按 Unix 纪元对齐的固定窗口降采样，仅返回非空窗口，结果携带 `buckets`（每项含窗口 UTC 起始时间 `start` 及 `count`、`min`、`max`、`avg`、`last`，`last` 取窗口内最后一点，同时间取受理顺序最后者）；降采样查询区间最长 31 天。
   - 非法或越界参数返回 `400`（`invalid_request`）；设备不存在返回 `404`（`device_not_found`），已吊销设备仍可查询；无数据返回 `200` 和空结果。
 
+## 变更审计日志
+
+审计日志仅保存在当前进程内，服务重启即清空。以下变更在成功提交时原子追加一条事件：设备注册（`device.created`）、凭据轮换（`device.credential_rotated`）、吊销（`device.revoked`），规则创建（`rule.created`）、启停变更（`rule.enabled_changed`）、删除（`rule.deleted`），设备组创建（`group.created`）、成员替换（`group.members_replaced`），以及固件发布登记（`firmware_release.created`）、固件批次创建（`firmware_rollout.created`）。失败请求、读取入口与未列出的入口不记审计；幂等调用未改变状态时不追加（如重复吊销、启停值未变化）。
+
+每条事件含 `sequence`、`occurred_at`、`action`、`resource_type`、`resource_id`：`sequence` 从 1 开始严格递增且不复用；`occurred_at` 为 UTC RFC 3339 时间；`resource_type` 取 `action` 的点号前缀；`resource_id` 取主资源标识。事件绝不包含 `credential`、`session_token`、`payload` 或 `result`。日志仅保留最近 10000 条，淘汰最旧事件后 `sequence` 继续增长。
+
+- `GET /v1/audit-events`：查询审计日志，返回 `200` 与 `{"events": [...], "next_after": ...}`，事件按 `sequence` 升序。
+  - `after`：可选非负整数，只返回 `sequence` 严格大于它的事件；未传时从现存最早事件读取。
+  - `limit`：可选，1 至 100 的整数，缺省 50；过滤后按升序截取。
+  - `action`、`resource_id`：可选单值精确过滤条件。
+  - `next_after` 取本页最后一个 `sequence`；空页取 `after`，未传 `after` 时取 `0`。
+  - `after` 早于现存最老事件的前一序号时返回 `410`（`audit_cursor_expired`）。未知、重复、类型错误或越界的查询参数返回 `400`（`invalid_request`）。
+
 ## 验证
 
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-当前测试覆盖健康检查基线与设备注册、凭据认证、轮换、吊销、连接会话、心跳保活、MQTT 风格主题订阅、发布（QoS 0 与 QoS 1）、拉取、重投与确认、设备影子的期望/实际状态写入、差异计算、版本冲突与会话鉴权，以及规则引擎的创建、列表、启停、删除、字段校验、条件评估与动作投递（含顺序、QoS、不递归触发、回放不触发）的成功与失败语义；另覆盖 `clean_start=false` 持久会话的建立、离线 QoS 1 队列、每组合一份与独立 delivery_id、`matched_count` 口径、重连后的顺序与 dup 重投、确认历史、保留消息不回放、`clean_start=true` 清状态、非布尔值拒绝且无副作用，以及凭据轮换保留与设备吊销清除；并覆盖设备命令的下发、按创建顺序领取、dup 重领、归属转移、确认与幂等、过期与吊销取消、字段校验与会话鉴权语义；另覆盖设备组的创建、查询、整体替换、乐观版本与各类冲突（含重名、版本不符、组/设备不存在、重复或非法成员、吊销不移除成员），以及组命令批次的成员快照下发、空组零项批次、不可预测 batch_id、按成员顺序的结果、expected_group_version 冲突、含吊销成员整体拒绝、同组 request_id 幂等与内容冲突、并发至多一个批次、批次查询的子命令当前快照与六状态汇总、成员变化不影响旧批次、吊销按既有规则取消非终态子命令，以及子命令经既有轮询/重领/确认/单命令查询入口处理的端到端语义；另覆盖时序遥测的批量写入与原子校验、UTC 归一化、同设备 request_id 幂等与内容冲突、设备间隔离、会话鉴权语义、raw 升序与受理顺序排列、区间含头不含尾、纪元对齐固定窗口降采样（count/min/max/avg/last 与空窗口跳过）、查询区间上限、吊销设备可查询、凭据轮换与会话离线保留数据，以及 DEVICEFABRIC_TELEMETRY_PATH 持久化的跨重启恢复与存储失败 503 语义。
+当前测试覆盖健康检查基线与设备注册、凭据认证、轮换、吊销、连接会话、心跳保活、MQTT 风格主题订阅、发布（QoS 0 与 QoS 1）、拉取、重投与确认、设备影子的期望/实际状态写入、差异计算、版本冲突与会话鉴权，以及规则引擎的创建、列表、启停、删除、字段校验、条件评估与动作投递（含顺序、QoS、不递归触发、回放不触发）的成功与失败语义；另覆盖 `clean_start=false` 持久会话的建立、离线 QoS 1 队列、每组合一份与独立 delivery_id、`matched_count` 口径、重连后的顺序与 dup 重投、确认历史、保留消息不回放、`clean_start=true` 清状态、非布尔值拒绝且无副作用，以及凭据轮换保留与设备吊销清除；并覆盖设备命令的下发、按创建顺序领取、dup 重领、归属转移、确认与幂等、过期与吊销取消、字段校验与会话鉴权语义；另覆盖设备组的创建、查询、整体替换、乐观版本与各类冲突（含重名、版本不符、组/设备不存在、重复或非法成员、吊销不移除成员），以及组命令批次的成员快照下发、空组零项批次、不可预测 batch_id、按成员顺序的结果、expected_group_version 冲突、含吊销成员整体拒绝、同组 request_id 幂等与内容冲突、并发至多一个批次、批次查询的子命令当前快照与六状态汇总、成员变化不影响旧批次、吊销按既有规则取消非终态子命令，以及子命令经既有轮询/重领/确认/单命令查询入口处理的端到端语义；另覆盖时序遥测的批量写入与原子校验、UTC 归一化、同设备 request_id 幂等与内容冲突、设备间隔离、会话鉴权语义、raw 升序与受理顺序排列、区间含头不含尾、纪元对齐固定窗口降采样（count/min/max/avg/last 与空窗口跳过）、查询区间上限、吊销设备可查询、凭据轮换与会话离线保留数据，以及 DEVICEFABRIC_TELEMETRY_PATH 持久化的跨重启恢复与存储失败 503 语义；另覆盖变更审计日志的十类事件追加时机、幂等未变更不追加、失败与读取不记录、sequence 严格递增、分页游标（after/limit/next_after）、action 与 resource_id 精确过滤、参数校验 400、保留窗口淘汰后的 410 游标过期语义。

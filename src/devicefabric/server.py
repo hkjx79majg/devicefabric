@@ -61,6 +61,12 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/v1/rules":
             self.handle_service_call(lambda: (200, self.service.list_rules()))
             return
+        audit_query = self._extract_audit_query(self.path)
+        if audit_query is not None:
+            self.handle_service_call(
+                lambda: (200, self.service.query_audit_events(audit_query))
+            )
+            return
         group_batch = self._extract_group_batch_ids(self.path)
         if group_batch is not None:
             if group_batch is INVALID_ID_SEGMENT:
@@ -348,6 +354,14 @@ class Handler(BaseHTTPRequestHandler):
         if segment and all(ch.isascii() and (ch.isalnum() or ch in "._-") for ch in segment):
             return segment, query
         return None
+
+    @staticmethod
+    def _extract_audit_query(path: str) -> str | None:
+        """匹配 /v1/audit-events[?query]，返回查询串（可为空串）。"""
+        bare, _, query = path.partition("?")
+        if bare != "/v1/audit-events":
+            return None
+        return query
 
     @staticmethod
     def _extract_rule_id(path: str, suffix: str = "") -> str | None:
