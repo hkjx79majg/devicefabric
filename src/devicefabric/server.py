@@ -71,6 +71,16 @@ class Handler(BaseHTTPRequestHandler):
                 lambda: (200, self.service.get_command_batch(group_id, batch_id))
             )
             return
+        group_rollout = self._extract_group_rollout_ids(self.path)
+        if group_rollout is not None:
+            if group_rollout is INVALID_ID_SEGMENT:
+                self.send_invalid_identifier()
+                return
+            group_id, rollout_id = group_rollout
+            self.handle_service_call(
+                lambda: (200, self.service.get_firmware_rollout(group_id, rollout_id))
+            )
+            return
         group_id = self._extract_group_id(self.path)
         if group_id is not None:
             if group_id is INVALID_ID_SEGMENT:
@@ -158,6 +168,25 @@ class Handler(BaseHTTPRequestHandler):
                 return 201, self.service.create_group(self.read_json_object())
             self.handle_service_call(action)
             return
+        if path == "/v1/firmware-releases":
+            def action() -> tuple[int, dict]:
+                return 201, self.service.create_firmware_release(
+                    self.read_json_object()
+                )
+            self.handle_service_call(action)
+            return
+        group_rollouts = self._extract_group_id(path, "/firmware-rollouts")
+        if group_rollouts is not None:
+            if group_rollouts is INVALID_ID_SEGMENT:
+                self.send_invalid_identifier()
+                return
+            group_id: str = group_rollouts
+            def action() -> tuple[int, dict]:
+                return 202, self.service.create_firmware_rollout(
+                    group_id, self.read_json_object()
+                )
+            self.handle_service_call(action)
+            return
         group_batches = self._extract_group_id(path, "/command-batches")
         if group_batches is not None:
             if group_batches is INVALID_ID_SEGMENT:
@@ -221,6 +250,23 @@ class Handler(BaseHTTPRequestHandler):
         if session_id is not None:
             def action() -> tuple[int, dict]:
                 return 200, self.service.poll_commands(session_id, self.read_json_object())
+            self.handle_service_call(action)
+            return
+        session_id = self._extract_session_id(path, "/firmware/poll")
+        if session_id is not None:
+            def action() -> tuple[int, dict]:
+                return 200, self.service.poll_firmware_update(
+                    session_id, self.read_json_object()
+                )
+            self.handle_service_call(action)
+            return
+        firmware_ack_ids = self._extract_session_firmware_ack_ids(path)
+        if firmware_ack_ids is not None:
+            session_id, update_id = firmware_ack_ids
+            def action() -> tuple[int, dict]:
+                return 200, self.service.ack_firmware_update(
+                    session_id, update_id, self.read_json_object()
+                )
             self.handle_service_call(action)
             return
         ack_ids = self._extract_session_command_ack_ids(path)
@@ -391,6 +437,47 @@ class Handler(BaseHTTPRequestHandler):
         session_segment, _, command_segment = middle.partition(marker)
         if cls._valid_id_segment(session_segment) and cls._valid_id_segment(command_segment):
             return session_segment, command_segment
+        return None
+
+    @classmethod
+    def _extract_group_rollout_ids(cls, path: str) -> tuple[str, str] | object | None:
+        """匹配 /v1/device-groups/{group_id}/firmware-rollouts/{rollout_id}。
+
+        形状不匹配返回 None；两个标识均为单段但任一非法返回
+        INVALID_ID_SEGMENT。
+        """
+        prefix = "/v1/device-groups/"
+        marker = "/firmware-rollouts/"
+        if not path.startswith(prefix) or marker not in path:
+            return None
+        group_segment, _, rollout_segment = path[len(prefix):].partition(marker)
+        if not group_segment or not rollout_segment:
+            return None
+        if "/" in group_segment or "/" in rollout_segment:
+            return None
+        if not (
+            cls._valid_id_segment(group_segment)
+            and cls._valid_id_segment(rollout_segment)
+        ):
+            return INVALID_ID_SEGMENT
+        return group_segment, rollout_segment
+
+    @classmethod
+    def _extract_session_firmware_ack_ids(cls, path: str) -> tuple[str, str] | None:
+        """匹配 /v1/device-sessions/{session_id}/firmware/{update_id}/ack。"""
+        prefix = "/v1/device-sessions/"
+        marker = "/firmware/"
+        suffix = "/ack"
+        if (
+            not path.startswith(prefix)
+            or not path.endswith(suffix)
+            or marker not in path
+        ):
+            return None
+        middle = path[len(prefix):len(path) - len(suffix)]
+        session_segment, _, update_segment = middle.partition(marker)
+        if cls._valid_id_segment(session_segment) and cls._valid_id_segment(update_segment):
+            return session_segment, update_segment
         return None
 
     def log_message(self, fmt: str, *args: object) -> None:
