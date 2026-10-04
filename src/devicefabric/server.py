@@ -25,16 +25,20 @@ def env_address() -> tuple[str, int]:
 class Handler(BaseHTTPRequestHandler):
     service = Service()
 
-    def send_json(self, status: int, payload: dict) -> None:
+    def send_json(self, status: int, payload: dict, headers: dict | None = None) -> None:
         body = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
 
-    def send_error_json(self, status: int, code: str, message: str) -> None:
-        self.send_json(status, {"error": {"code": code, "message": message}})
+    def send_error_json(
+        self, status: int, code: str, message: str, headers: dict | None = None
+    ) -> None:
+        self.send_json(status, {"error": {"code": code, "message": message}}, headers)
 
     def read_json_object(self) -> object:
         length_raw = self.headers.get("Content-Length")
@@ -50,7 +54,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             status, payload = call()
         except ServiceError as exc:
-            self.send_error_json(exc.status, exc.code, exc.message)
+            self.send_error_json(exc.status, exc.code, exc.message, exc.headers)
             return
         self.send_json(status, payload)
 
