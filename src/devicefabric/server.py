@@ -7,7 +7,7 @@ import json
 import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from .service import Service, ServiceError
+from .service import RateLimitError, Service, ServiceError
 
 # 路径匹配到了对应路由但标识符段非法：返回 400（invalid_request），
 # 而不是按未匹配处理为 404。
@@ -25,16 +25,28 @@ def env_address() -> tuple[str, int]:
 class Handler(BaseHTTPRequestHandler):
     service = Service()
 
-    def send_json(self, status: int, payload: dict) -> None:
+    def send_json(
+        self, status: int, payload: dict, headers: dict[str, str] | None = None
+    ) -> None:
         body = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
 
-    def send_error_json(self, status: int, code: str, message: str) -> None:
-        self.send_json(status, {"error": {"code": code, "message": message}})
+    def send_error_json(
+        self,
+        status: int,
+        code: str,
+        message: str,
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        self.send_json(
+            status, {"error": {"code": code, "message": message}}, headers=headers
+        )
 
     def read_json_object(self) -> object:
         length_raw = self.headers.get("Content-Length")
@@ -49,6 +61,17 @@ class Handler(BaseHTTPRequestHandler):
     def handle_service_call(self, call) -> None:
         try:
             status, payload = call()
+        except RateLimitError as exc:
+            # 统一错误体之外额外携带 Retry-After（到下一个 UTC 分钟边界的
+            # 向上取整秒数）。RateLimitError 是 ServiceError 的子类，必须
+            # 先于 ServiceError 捕获。
+            self.send_error_json(
+                exc.status,
+                exc.code,
+                exc.message,
+                headers={"Retry-After": str(exc.retry_after)},
+            )
+            return
         except ServiceError as exc:
             self.send_error_json(exc.status, exc.code, exc.message)
             return

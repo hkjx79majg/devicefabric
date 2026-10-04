@@ -87,6 +87,13 @@ TELEMETRY_RESOLUTIONS = frozenset({"raw", "60", "300", "3600"})
 TELEMETRY_RAW_MAX_SECONDS = 24 * 3600
 TELEMETRY_DOWNSAMPLED_MAX_SECONDS = 31 * 24 * 3600
 TELEMETRY_PATH_ENV = "DEVICEFABRIC_TELEMETRY_PATH"
+# 按设备隔离的固定窗口限流配置：每个 UTC 自然分钟内每台设备可受理的发布
+# 请求数 / 遥测点数。未设置或值为 0 时关闭对应限流。
+PUBLISH_RATE_LIMIT_ENV = "DEVICEFABRIC_PUBLISH_RATE_LIMIT"
+TELEMETRY_POINT_RATE_LIMIT_ENV = "DEVICEFABRIC_TELEMETRY_POINT_RATE_LIMIT"
+# 固定窗口长度（秒）：UTC 自然分钟；Retry-After 取值范围 1..60。
+RATE_WINDOW_SECONDS = 60
+RATE_WINDOW_MICROSECONDS = RATE_WINDOW_SECONDS * 1_000_000
 
 AUDIT_RETENTION = 10000
 AUDIT_LIMIT_MIN = 1
@@ -115,6 +122,44 @@ class ServiceError(Exception):
             self.code = code
         if status is not None:
             self.status = status
+
+
+class RateLimitError(ServiceError):
+    """固定窗口配额耗尽：429 rate_limit_exceeded，携带 Retry-After 秒数。
+
+    retry_after 为到下一个 UTC 分钟边界的向上取整秒数，范围 1 至
+    RATE_WINDOW_SECONDS。
+    """
+
+    code = "rate_limit_exceeded"
+    status = 429
+
+    def __init__(self, message: str, retry_after: int):
+        super().__init__(message, code=self.code, status=self.status)
+        self.retry_after = retry_after
+
+
+def _parse_rate_limit(raw: str | None) -> int | None:
+    """解析限流环境变量：未设置或值为 0 表示关闭（返回 None）。
+
+    仅接受十进制非负整数；负数、小数或其他无法解析的内容不构成有效配额，
+    按关闭处理（None），避免非法配置中断服务启动。
+    """
+    if raw is None:
+        return None
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def _retry_after_for_window(now_micros: int) -> int:
+    """距下一个 UTC 分钟边界的向上取整秒数（窗口起点以纪元微秒对齐）。"""
+    position = now_micros % RATE_WINDOW_MICROSECONDS
+    remaining = RATE_WINDOW_MICROSECONDS - position
+    seconds = (remaining + 999_999) // 1_000_000
+    return max(1, min(RATE_WINDOW_SECONDS, seconds))
 
 
 def _utc_now() -> datetime:
@@ -483,7 +528,13 @@ class Service:
     name = "devicefabric"
     version = __version__
 
-    def __init__(self, telemetry_path: str | None = None) -> None:
+    def __init__(
+        self,
+        telemetry_path: str | None = None,
+        *,
+        publish_rate_limit: int | None = None,
+        telemetry_point_rate_limit: int | None = None,
+    ) -> None:
         self._lock = threading.Lock()
         self._devices: dict[str, dict] = {}
         # 记录本进程签发过的全部凭据，保证凭据在进程内绝不重复。
@@ -569,6 +620,22 @@ class Service:
         self._telemetry_path = telemetry_path or None
         if self._telemetry_path is not None and os.path.exists(self._telemetry_path):
             self._load_telemetry()
+        # 按设备隔离的固定窗口限流。显式参数优先；否则读环境变量，未设置
+        # 或值为 0 时对应限流关闭（None）。计数器仅存在当前进程内，重启即
+        # 清空，且不随遥测落盘。每类限流为 (limit, {device_id: (window,
+        # used)})，window 为 UTC 纪元对齐的分钟序号。
+        if publish_rate_limit is None:
+            publish_rate_limit = _parse_rate_limit(
+                os.environ.get(PUBLISH_RATE_LIMIT_ENV)
+            )
+        self._publish_rate_limit = publish_rate_limit or None
+        if telemetry_point_rate_limit is None:
+            telemetry_point_rate_limit = _parse_rate_limit(
+                os.environ.get(TELEMETRY_POINT_RATE_LIMIT_ENV)
+            )
+        self._telemetry_point_rate_limit = telemetry_point_rate_limit or None
+        self._publish_usage: dict[str, tuple[int, int]] = {}
+        self._telemetry_usage: dict[str, tuple[int, int]] = {}
 
     def _load_telemetry(self) -> None:
         """从持久化文件恢复遥测数据与幂等记录（启动时调用，无需持锁）。"""
@@ -1093,6 +1160,45 @@ class Service:
             )
         return session
 
+    def _acquire_rate_quota_locked(
+        self,
+        limit: int | None,
+        usage: dict[str, tuple[int, int]],
+        device_id: str,
+        amount: int,
+        now: datetime,
+    ) -> None:
+        """在已持锁状态下为某设备原子占用固定窗口额度。
+
+        窗口按 UTC 自然分钟对齐（纪元分钟序号）；跨分钟立即恢复完整额度。
+        剩余额度不足时整笔占用失败并抛 RateLimitError，不改变任何计数或
+        其他状态。limit 为 None（限流关闭）时直接放行。
+        """
+        if limit is None:
+            return
+        now_micros = _epoch_microseconds(now)
+        window = now_micros // RATE_WINDOW_MICROSECONDS
+        current_window, used = usage.get(device_id, (window, 0))
+        if current_window != window:
+            used = 0
+        if used + amount > limit:
+            raise RateLimitError(
+                "rate limit exceeded for this device in the current UTC minute window",
+                _retry_after_for_window(now_micros),
+            )
+        usage[device_id] = (window, used + amount)
+
+    @staticmethod
+    def _rollback_rate_quota_locked(
+        usage: dict[str, tuple[int, int]], device_id: str, amount: int
+    ) -> None:
+        """归还同一锁内刚占用且随后失败（如落盘 503）的额度。"""
+        record = usage.get(device_id)
+        if record is None:
+            return
+        window, used = record
+        usage[device_id] = (window, max(0, used - amount))
+
     @staticmethod
     def _require_fields(
         payload: object, fields: set[str], optional: set[str] | None = None
@@ -1178,6 +1284,16 @@ class Service:
             now = _utc_now()
             publisher = self._authenticate_online_session_locked(
                 session_id, token, now
+            )
+            # 通过字段校验、会话鉴权与在线状态检查后占用一个发布额度；
+            # 额度不足时原消息、保留状态、订阅队列、离线队列与规则动作均
+            # 不产生变化。规则动作不另行计数。
+            self._acquire_rate_quota_locked(
+                self._publish_rate_limit,
+                self._publish_usage,
+                publisher["device_id"],
+                1,
+                now,
             )
             message = {
                 "message_id": self._mint_message_id_locked(),
@@ -2444,9 +2560,10 @@ class Service:
         points = _validate_telemetry_points(data["points"])
 
         with self._lock:
+            now = _utc_now()
             # 沿用会话鉴权及保活规则：未知 404、令牌错误 401、已离线 409。
             session = self._authenticate_online_session_locked(
-                session_id, token, _utc_now()
+                session_id, token, now
             )
             device_id = session["device_id"]
             key = (device_id, request_id)
@@ -2475,6 +2592,16 @@ class Service:
                     "request_id": request_id,
                     "accepted_count": existing["accepted_count"],
                 }
+            # 非幂等重试的新批次：按 points 数量原子占用额度。整批超过
+            # 剩余额度时不写入任何数据或幂等记录。
+            point_count = len(points)
+            self._acquire_rate_quota_locked(
+                self._telemetry_point_rate_limit,
+                self._telemetry_usage,
+                device_id,
+                point_count,
+                now,
+            )
             entries = []
             for index, point in enumerate(points, start=1):
                 entries.append(
@@ -2502,6 +2629,10 @@ class Service:
                 try:
                     self._persist_telemetry_locked(entries, (key, record))
                 except OSError as exc:
+                    # 既有 503 失败不消耗额度：回滚本批占用的窗口计数。
+                    self._rollback_rate_quota_locked(
+                        self._telemetry_usage, device_id, point_count
+                    )
                     raise ServiceError(
                         "telemetry storage unavailable",
                         code="telemetry_storage_unavailable",
